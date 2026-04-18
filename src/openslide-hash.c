@@ -98,6 +98,58 @@ bool _openslide_hash_file_part(struct _openslide_hash *hash,
   return true;
 }
 
+// Provider-backed hash functions for Phase 3 migration
+bool _openslide_hash_readable(struct _openslide_hash *hash,
+                              struct _openslide_readable *readable,
+                              GError **err) {
+  return _openslide_hash_readable_part(hash, readable, 0, -1, err);
+}
+
+bool _openslide_hash_readable_part(struct _openslide_hash *hash,
+                                   struct _openslide_readable *readable,
+                                   int64_t offset, int64_t size,
+                                   GError **err) {
+  int64_t file_size;
+  if (!_openslide_readable_get_size(readable, &file_size, err)) {
+    return false;
+  }
+
+  if (size == -1) {
+    // hash to end of file
+    size = file_size - offset;
+  }
+
+  if (offset < 0 || offset > file_size) {
+    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                "Invalid hash offset: %" PRId64, offset);
+    return false;
+  }
+
+  if (offset + size > file_size) {
+    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                "Hash range exceeds file size");
+    return false;
+  }
+
+  uint8_t buf[4096];
+  int64_t bytes_left = size;
+
+  while (bytes_left > 0) {
+    int64_t bytes_to_read = MIN((int64_t) sizeof buf, bytes_left);
+    int64_t read_offset = offset + (size - bytes_left);
+
+    if (!_openslide_readable_read_exact(readable, read_offset, buf,
+                                        (size_t) bytes_to_read, err)) {
+      return false;
+    }
+
+    bytes_left -= bytes_to_read;
+    _openslide_hash_data(hash, buf, bytes_to_read);
+  }
+
+  return true;
+}
+
 // Invalidate this hash.  Use if this slide is unhashable for some reason.
 void _openslide_hash_disable(struct _openslide_hash *hash) {
   if (hash) {

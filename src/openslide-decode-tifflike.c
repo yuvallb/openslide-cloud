@@ -37,6 +37,7 @@
 
 struct _openslide_tifflike {
   char *filename;
+  struct _openslide_object_ref *ref;  // Phase 3: provider-backed reference
   bool big_endian;
   bool ndpi;
   GPtrArray *directories;
@@ -332,11 +333,6 @@ static bool populate_item(struct _openslide_tifflike *tl,
     return true;
   }
 
-  g_autoptr(_openslide_file) f = _openslide_fopen(tl->filename, err);
-  if (!f) {
-    return false;
-  }
-
   uint64_t count = item->count;
   uint32_t value_size = get_value_size(item->type, &count);
   g_assert(value_size);
@@ -350,13 +346,34 @@ static bool populate_item(struct _openslide_tifflike *tl,
   }
 
   //g_debug("reading tiff value: len: %"PRIu64", offset %"PRIu64, len, item->offset);
-  if (!_openslide_fseek(f, item->offset, SEEK_SET, err)) {
-    g_prefix_error(err, "Couldn't seek to read TIFF value: ");
-    return false;
-  }
-  if (!_openslide_fread_exact(f, buf, len, err)) {
-    g_prefix_error(err, "Couldn't read TIFF value: ");
-    return false;
+
+  // Phase 3: Use provider-backed readable if available
+  if (tl->ref) {
+    g_autoptr(_openslide_readable) obj = _openslide_readable_open(tl->ref, err);
+    if (!obj) {
+      g_prefix_error(err, "Couldn't open TIFF file for reading: ");
+      return false;
+    }
+
+    if (!_openslide_readable_read_exact(obj, item->offset, buf, len, err)) {
+      g_prefix_error(err, "Couldn't read TIFF value: ");
+      return false;
+    }
+  } else {
+    // Fallback to legacy path-based reading
+    g_autoptr(_openslide_file) f = _openslide_fopen(tl->filename, err);
+    if (!f) {
+      return false;
+    }
+
+    if (!_openslide_fseek(f, item->offset, SEEK_SET, err)) {
+      g_prefix_error(err, "Couldn't seek to read TIFF value: ");
+      return false;
+    }
+    if (!_openslide_fread_exact(f, buf, len, err)) {
+      g_prefix_error(err, "Couldn't read TIFF value: ");
+      return false;
+    }
   }
 
   fix_byte_order(buf, value_size, count, tl->big_endian);
@@ -597,6 +614,15 @@ struct _openslide_tifflike *_openslide_tifflike_create(const char *filename,
   tl->directories = g_ptr_array_new();
   g_mutex_init(&tl->value_lock);
 
+  // Phase 3: Create provider-backed object reference
+  g_autoptr(GError) ref_err = NULL;
+  if (!_openslide_object_ref_from_local_path(filename, &tl->ref, &ref_err)) {
+    // It's ok if we can't create an object_ref - we'll fall back to path-based
+    // This allows gradual migration
+    g_debug("Couldn't create object_ref for TIFF file: %s", ref_err ? ref_err->message : "unknown");
+    tl->ref = NULL;
+  }
+
   // initialize directory reading
   g_autoptr(GHashTable) loop_detector =
     g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
@@ -682,6 +708,7 @@ void _openslide_tifflike_destroy(struct _openslide_tifflike *tl) {
   g_mutex_unlock(&tl->value_lock);
   g_ptr_array_free(tl->directories, true);
   g_free(tl->filename);
+  _openslide_object_ref_unref(tl->ref);  // Phase 3
   g_mutex_clear(&tl->value_lock);
   g_free(tl);
 }

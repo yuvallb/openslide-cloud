@@ -25,112 +25,63 @@
 #include "openslide-private.h"
 
 #include <stdio.h>
-#include <stdarg.h>
-#include <string.h>
-#include <errno.h>
 #include <glib.h>
 
-#ifndef _WIN32
-#include <unistd.h>
-#include <fcntl.h>
-#endif
-
-#if !defined(HAVE_FSEEKO) && defined(_WIN32)
-#define fseeko _fseeki64
-#endif
-#if !defined(HAVE_FTELLO) && defined(_WIN32)
-#define ftello _ftelli64
-#endif
-
 struct _openslide_file {
-  FILE *fp;
+  struct _openslide_readable *readable;
+  struct _openslide_object_ref *ref;
+  int64_t cursor;
   char *path;
 };
 
 struct _openslide_dir {
-  GDir *dir;
+  GPtrArray *entries;
+  guint index;
   char *path;
 };
 
-static void wrap_fclose(FILE *fp) {
-  fclose(fp);  // ci-allow
-}
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(FILE, wrap_fclose)
+struct _openslide_file *_openslide_fopen_ref(const struct _openslide_object_ref *ref,
+                                             GError **err) {
+  g_autoptr(_openslide_readable) readable = _openslide_readable_open(ref, err);
+  if (readable == NULL) {
+    return NULL;
+  }
 
-static void io_error(GError **err, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
-static void io_error(GError **err, const char *fmt, ...) {
-  int my_errno = errno;
-  va_list ap;
-
-  va_start(ap, fmt);
-  g_autofree char *msg = g_strdup_vprintf(fmt, ap);
-  g_set_error(err, G_FILE_ERROR, g_file_error_from_errno(my_errno),
-              "%s: %s", msg, g_strerror(my_errno));
-  va_end(ap);
+  struct _openslide_file *file = g_new0(struct _openslide_file, 1);
+  file->readable = g_steal_pointer(&readable);
+  file->ref = _openslide_object_ref_ref((struct _openslide_object_ref *) ref);
+  file->cursor = 0;
+  file->path = g_strdup(_openslide_object_ref_get_debug_name(ref));
+  return file;
 }
 
 struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
-  g_autoptr(FILE) f = NULL;
-
-#ifdef _WIN32
-  g_autofree wchar_t *path16 =
-    (wchar_t *) g_utf8_to_utf16(path, -1, NULL, NULL, err);
-  if (path16 == NULL) {
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  if (!_openslide_object_ref_from_local_path(path, &ref, err)) {
     g_prefix_error(err, "Couldn't open %s: ", path);
     return NULL;
   }
-  f = _wfopen(path16, L"rb" FOPEN_CLOEXEC_FLAG);
-  if (f == NULL) {
-    io_error(err, "Couldn't open %s", path);
-    return NULL;
-  }
-#else
-  f = fopen(path, "rb" FOPEN_CLOEXEC_FLAG);  // ci-allow
-  if (f == NULL) {
-    io_error(err, "Couldn't open %s", path);
-    return NULL;
-  }
-  /* Unnecessary if FOPEN_CLOEXEC_FLAG is non-empty, but compile-checked */
-  if (!FOPEN_CLOEXEC_FLAG[0]) {
-    int fd = fileno(f);
-    if (fd == -1) {
-      io_error(err, "Couldn't fileno() %s", path);
-      return NULL;
-    }
-    long flags = fcntl(fd, F_GETFD);
-    if (flags == -1) {
-      io_error(err, "Couldn't F_GETFD %s", path);
-      return NULL;
-    }
-    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC)) {
-      io_error(err, "Couldn't F_SETFD %s", path);
-      return NULL;
-    }
-  }
-#endif
 
-  struct _openslide_file *file = g_new0(struct _openslide_file, 1);
-  file->fp = g_steal_pointer(&f);
-  file->path = g_strdup(path);
-  return file;
+  return _openslide_fopen_ref(ref, err);
 }
 
 // returns 0/NULL on EOF and 0/non-NULL on I/O error
 size_t _openslide_fread(struct _openslide_file *file, void *buf, size_t size,
                         GError **err) {
-  char *bufp = buf;
   size_t total = 0;
-  while (total < size) {
-    size_t count = fread(bufp + total, 1, size - total, file->fp);  // ci-allow
-    if (count == 0) {
-      break;
+  if (!_openslide_readable_read_at(file->readable,
+                                   file->cursor,
+                                   buf,
+                                   size,
+                                   &total,
+                                   err)) {
+    if (err && *err == NULL) {
+      g_set_error(err, G_FILE_ERROR, G_FILE_ERROR_IO,
+                  "I/O error reading file %s", file->path);
     }
-    total += count;
+    return 0;
   }
-  if (total == 0 && ferror(file->fp)) {
-    g_set_error(err, G_FILE_ERROR, G_FILE_ERROR_IO,
-                "I/O error reading file %s", file->path);
-  }
+  file->cursor += total;
   return total;
 }
 
@@ -152,75 +103,88 @@ bool _openslide_fread_exact(struct _openslide_file *file,
 
 bool _openslide_fseek(struct _openslide_file *file, int64_t offset, int whence,
                       GError **err) {
-  if (fseeko(file->fp, offset, whence)) {  // ci-allow
-    io_error(err, "Couldn't seek file %s", file->path);
+  int64_t size;
+  if (!_openslide_readable_get_size(file->readable, &size, err)) {
+    g_prefix_error(err, "Couldn't seek file %s: ", file->path);
     return false;
   }
+
+  int64_t new_offset = _openslide_compute_seek(file->cursor, size, offset, whence);
+  if (new_offset < 0) {
+    g_set_error(err, G_FILE_ERROR, G_FILE_ERROR_INVAL,
+                "Invalid seek in file %s", file->path);
+    return false;
+  }
+
+  file->cursor = new_offset;
   return true;
 }
 
 int64_t _openslide_ftell(struct _openslide_file *file, GError **err) {
-  int64_t ret = ftello(file->fp);  // ci-allow
-  if (ret == -1) {
-    io_error(err, "Couldn't get offset of %s", file->path);
+  if (err && *err) {
+    return -1;
   }
-  return ret;
+  return file->cursor;
 }
 
 int64_t _openslide_fsize(struct _openslide_file *file, GError **err) {
-  int64_t orig = _openslide_ftell(file, err);
-  if (orig == -1) {
-    g_prefix_error(err, "Couldn't get size: ");
-    return -1;
-  }
-  if (!_openslide_fseek(file, 0, SEEK_END, err)) {
-    g_prefix_error(err, "Couldn't get size: ");
-    return -1;
-  }
-  int64_t ret = _openslide_ftell(file, err);
-  if (ret == -1) {
-    g_prefix_error(err, "Couldn't get size: ");
-    return -1;
-  }
-  if (!_openslide_fseek(file, orig, SEEK_SET, err)) {
-    g_prefix_error(err, "Couldn't get size: ");
+  int64_t ret;
+  if (!_openslide_readable_get_size(file->readable, &ret, err)) {
+    g_prefix_error(err, "Couldn't get size of %s: ", file->path);
     return -1;
   }
   return ret;
 }
 
 void _openslide_fclose(struct _openslide_file *file) {
-  fclose(file->fp);  // ci-allow
+  _openslide_readable_close(file->readable);
+  _openslide_object_ref_unref(file->ref);
   g_free(file->path);
   g_free(file);
 }
 
-bool _openslide_fexists(const char *path, GError **err G_GNUC_UNUSED) {
-  return g_file_test(path, G_FILE_TEST_EXISTS);  // ci-allow
+bool _openslide_fexists(const char *path, GError **err) {
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  if (!_openslide_object_ref_from_local_path(path, &ref, err)) {
+    return false;
+  }
+  return _openslide_fexists_ref(ref, err);
+}
+
+bool _openslide_fexists_ref(const struct _openslide_object_ref *ref,
+                            GError **err) {
+  return _openslide_object_ref_exists(ref, err);
 }
 
 struct _openslide_dir *_openslide_dir_open(const char *dirname, GError **err) {
-  g_autoptr(_openslide_dir) d = g_new0(struct _openslide_dir, 1);
-  d->dir = g_dir_open(dirname, 0, err);
-  if (!d->dir) {
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  if (!_openslide_object_ref_from_local_path(dirname, &ref, err)) {
     return NULL;
   }
+
+  g_autoptr(GPtrArray) entries = NULL;
+  if (!_openslide_object_ref_list_children(ref, &entries, err)) {
+    return NULL;
+  }
+
+  g_autoptr(_openslide_dir) d = g_new0(struct _openslide_dir, 1);
+  d->entries = g_steal_pointer(&entries);
+  d->index = 0;
   d->path = g_strdup(dirname);
   return g_steal_pointer(&d);
 }
 
-const char *_openslide_dir_next(struct _openslide_dir *d, GError **err) {
-  errno = 0;
-  const char *ret = g_dir_read_name(d->dir);
-  if (!ret && errno) {
-    io_error(err, "Reading directory %s", d->path);
+const char *_openslide_dir_next(struct _openslide_dir *d, GError **err G_GNUC_UNUSED) {
+  if (d->index >= d->entries->len) {
+    return NULL;
   }
-  return ret;
+  struct _openslide_list_entry *entry = g_ptr_array_index(d->entries, d->index++);
+  return entry->name;
 }
 
 void _openslide_dir_close(struct _openslide_dir *d) {
-  if (d->dir) {
-    g_dir_close(d->dir);
+  if (d->entries) {
+    g_ptr_array_unref(d->entries);
   }
   g_free(d->path);
   g_free(d);

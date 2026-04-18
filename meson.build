@@ -172,6 +172,35 @@ dicom_dep = dependency(
   default_options : ['tests=false'],
   version : '>=1.2.0',
 )
+s3_opt = get_option('s3')
+s3_dep = dependency(
+  'libcurl',
+  required : s3_opt,
+)
+if s3_dep.found()
+  conf.set('HAVE_S3_PROVIDER', 1)
+  feature_flags += 's3-provider'
+endif
+
+gcs_opt = get_option('gcs')
+gcs_dep = dependency(
+  'libcurl',
+  required : gcs_opt,
+)
+if gcs_dep.found()
+  conf.set('HAVE_GCS_PROVIDER', 1)
+  feature_flags += 'gcs-provider'
+endif
+
+azure_opt = get_option('azure')
+azure_dep = dependency(
+  'libcurl',
+  required : azure_opt,
+)
+if azure_dep.found()
+  conf.set('HAVE_AZURE_PROVIDER', 1)
+  feature_flags += 'azure-provider'
+endif
 
 # Dependency checks
 if jpeg_dep.type_name() != 'internal' and not cc.has_function(

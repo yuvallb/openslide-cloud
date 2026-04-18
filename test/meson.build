@@ -1,3 +1,26 @@
+storage_primitives_deps = [
+  declare_dependency(
+    include_directories : config_h_include,
+  ),
+  openslide_dep,
+  glib_dep,
+  cairo_dep,
+]
+storage_primitives_deps += (s3_dep.found() ? [s3_dep] : [])
+storage_primitives_deps += (gcs_dep.found() ? [gcs_dep] : [])
+storage_primitives_deps += (azure_dep.found() ? [azure_dep] : [])
+storage_primitives = executable(
+  'storage-primitives',
+  'storage-primitives.c',
+  '../src/openslide-storage.c',
+  '../src/openslide-error.c',
+  dependencies : storage_primitives_deps,
+)
+test(
+  'storage-primitives',
+  storage_primitives,
+)
+
 # Required dependencies
 foreach dep : ['cjpeg', 'djpeg', 'xdelta3']
   set_variable(

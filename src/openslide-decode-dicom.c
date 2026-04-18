@@ -31,6 +31,8 @@ struct _openslide_dicom_io {
   struct _openslide_file *file;  // may not be present without ensure_file()
   int64_t offset;
   int64_t size;
+  struct _openslide_object_ref *ref;  // Phase 3: provider-backed reference
+  struct _openslide_readable *readable;  // Phase 3: provider-backed readable handle
 };
 
 void _openslide_dicom_propagate_error(GError **err, DcmError *dcm_error) {
@@ -52,6 +54,12 @@ static void propagate_gerror(DcmError **dcm_error, GError *err) {
 static void dicom_io_free(struct _openslide_dicom_io *dio) {
   if (dio->file) {
     _openslide_fclose(dio->file);
+  }
+  if (dio->readable) {
+    _openslide_readable_close(dio->readable);
+  }
+  if (dio->ref) {
+    _openslide_object_ref_unref(dio->ref);
   }
   g_free(dio->filename);
   g_free(dio);
@@ -75,6 +83,18 @@ static bool ensure_file(struct _openslide_dicom_io *dio, GError **err) {
   return true;
 }
 
+// Ensure readable is available for provider-backed access.
+static bool ensure_readable(struct _openslide_dicom_io *dio, GError **err) {
+  if (dio->readable) {
+    return true;
+  }
+  if (!dio->ref) {
+    return false;
+  }
+  dio->readable = _openslide_readable_open(dio->ref, err);
+  return dio->readable != NULL;
+}
+
 static DcmIO *vfs_open(DcmError **dcm_error, void *client) {
   g_autoptr(_openslide_dicom_io) dio = g_new0(struct _openslide_dicom_io, 1);
   dio->filename = g_strdup(client);
@@ -88,6 +108,12 @@ static DcmIO *vfs_open(DcmError **dcm_error, void *client) {
   if (dio->size == -1) {
     propagate_gerror(dcm_error, tmp_err);
     return NULL;
+  }
+
+  // Best effort object_ref for provider-backed reads.
+  g_autoptr(GError) ref_err = NULL;
+  if (!_openslide_object_ref_from_local_path(client, &dio->ref, &ref_err)) {
+    dio->ref = NULL;
   }
 
   return (DcmIO *) g_steal_pointer(&dio);
@@ -114,6 +140,26 @@ static int64_t vfs_read(DcmError **dcm_error, DcmIO *io,
   return count;
 }
 
+// Phase 3: Provider-backed read implementation
+static int64_t vfs_read_readable(DcmError **dcm_error, DcmIO *io,
+                                 char *buffer, int64_t length) {
+  struct _openslide_dicom_io *dio = (struct _openslide_dicom_io *) io;
+  GError *tmp_err = NULL;
+  if (!ensure_readable(dio, &tmp_err)) {
+    // Fall back to file-based reading
+    return vfs_read(dcm_error, io, buffer, length);
+  }
+
+  size_t bytes_read = 0;
+  if (!_openslide_readable_read_at(dio->readable, dio->offset, buffer,
+                                   (size_t) length, &bytes_read, &tmp_err)) {
+    propagate_gerror(dcm_error, tmp_err);
+    return -1;
+  }
+  dio->offset += (int64_t) bytes_read;
+  return (int64_t) bytes_read;
+}
+
 static int64_t vfs_seek(DcmError **dcm_error, DcmIO *io,
                         int64_t offset, int whence) {
   struct _openslide_dicom_io *dio = (struct _openslide_dicom_io *) io;
@@ -133,7 +179,7 @@ static int64_t vfs_seek(DcmError **dcm_error, DcmIO *io,
 static const DcmIOMethods dicom_open_methods = {
   .open = vfs_open,
   .close = vfs_close,
-  .read = vfs_read,
+  .read = vfs_read_readable,
   .seek = vfs_seek,
 };
 

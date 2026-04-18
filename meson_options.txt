@@ -16,6 +16,24 @@ option(
   description : 'Enable building documentation (requires Doxygen)',
 )
 option(
+  's3',
+  type : 'feature',
+  value : 'auto',
+  description : 'Enable AWS S3 storage provider support',
+)
+option(
+  'gcs',
+  type : 'feature',
+  value : 'auto',
+  description : 'Enable Google Cloud Storage provider support',
+)
+option(
+  'azure',
+  type : 'feature',
+  value : 'auto',
+  description : 'Enable Azure Blob Storage provider support',
+)
+option(
   '_export_internal_symbols',
   type : 'boolean',
   value : false,

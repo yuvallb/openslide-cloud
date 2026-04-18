@@ -53,6 +53,7 @@ enum image_format {
 
 struct dicom_file {
   char *filename;
+  struct _openslide_object_ref *ref;
 
   GMutex lock;
   DcmFilehandle *filehandle;
@@ -201,6 +202,7 @@ static struct syntax_format supported_syntax_formats[] = {
 static void dicom_file_destroy(struct dicom_file *f) {
   dcm_filehandle_destroy(f->filehandle);
   g_mutex_clear(&f->lock);
+  _openslide_object_ref_unref(f->ref);
   g_free(f->filename);
   g_free(f);
 }
@@ -352,16 +354,18 @@ static bool verify_tag_int(const DcmDataSet *dataset,
 // Only do the minimum checks necessary to reject files that are not valid
 // DICOM WSI files.  Allow skipping metadata load for vendor detection.
 // The rest of the initialization will happen in maybe_add_file().
-static struct dicom_file *dicom_file_new(const char *filename,
-                                         bool load_metadata, GError **err) {
+static struct dicom_file *dicom_file_new_ref(const struct _openslide_object_ref *ref,
+                                             bool load_metadata, GError **err) {
   g_autoptr(dicom_file) f = g_new0(struct dicom_file, 1);
   g_mutex_init(&f->lock);
 
-  f->filehandle = _openslide_dicom_open(filename, &f->dio, err);
+  f->filename = g_strdup(_openslide_object_ref_get_debug_name(ref));
+  f->ref = _openslide_object_ref_ref((struct _openslide_object_ref *) ref);
+
+  f->filehandle = _openslide_dicom_open(f->filename, &f->dio, err);
   if (!f->filehandle) {
     return NULL;
   }
-  f->filename = g_strdup(filename);
 
   DcmError *dcm_error = NULL;
   f->file_meta = dcm_filehandle_get_file_meta(&dcm_error, f->filehandle);
@@ -396,6 +400,15 @@ static struct dicom_file *dicom_file_new(const char *filename,
   _openslide_dicom_io_suspend(f->dio);
 
   return g_steal_pointer(&f);
+}
+
+static struct dicom_file *dicom_file_new(const char *filename,
+                                         bool load_metadata, GError **err) {
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  if (!_openslide_object_ref_from_local_path(filename, &ref, err)) {
+    return NULL;
+  }
+  return dicom_file_new_ref(ref, load_metadata, err);
 }
 
 static void level_destroy(struct dicom_level *l) {
@@ -1075,11 +1088,13 @@ static bool dicom_open(openslide_t *osr,
                        struct _openslide_tifflike *tl G_GNUC_UNUSED,
                        struct _openslide_hash *quickhash1,
                        GError **err) {
-  g_autofree char *dirname = g_path_get_dirname(filename);
-  g_autofree char *basename = g_path_get_basename(filename);
+  g_autoptr(_openslide_object_ref) start_ref = NULL;
+  if (!_openslide_object_ref_from_local_path(filename, &start_ref, err)) {
+    return false;
+  }
 
-  g_autoptr(_openslide_dir) dir = _openslide_dir_open(dirname, err);
-  if (!dir) {
+  g_autoptr(GPtrArray) children = NULL;
+  if (!_openslide_object_ref_list_children(start_ref, &children, err)) {
     return false;
   }
 
@@ -1088,7 +1103,7 @@ static bool dicom_open(openslide_t *osr,
                          OPENSLIDE_G_DESTROY_NOTIFY_WRAPPER(level_destroy));
 
   // open the passed-in file and get the slide-id
-  g_autoptr(dicom_file) start = dicom_file_new(filename, true, err);
+  g_autoptr(dicom_file) start = dicom_file_new_ref(start_ref, true, err);
   if (!start) {
     return false;
   }
@@ -1100,21 +1115,22 @@ static bool dicom_open(openslide_t *osr,
   }
 
   // scan for other DICOMs with this slide id
-  const char *name;
-  GError *dir_err = NULL;
-  while ((name = _openslide_dir_next(dir, &dir_err))) {
+  for (guint i = 0; i < children->len; i++) {
+    struct _openslide_list_entry *entry = children->pdata[i];
+
     // no need to add the start file again
-    if (g_str_equal(name, basename)) {
+    if (g_str_equal(_openslide_object_ref_get_debug_name(entry->ref),
+                    _openslide_object_ref_get_debug_name(start_ref))) {
       continue;
     }
 
-    g_autofree char *path = g_build_filename(dirname, name, NULL);
-
     GError *tmp_err = NULL;
-    g_autoptr(dicom_file) f = dicom_file_new(path, true, &tmp_err);
+    g_autoptr(dicom_file) f = dicom_file_new_ref(entry->ref, true, &tmp_err);
     if (!f) {
       if (_openslide_debug(OPENSLIDE_DEBUG_SEARCH)) {
-        g_message("opening %s: %s", path, tmp_err->message);
+        g_message("opening %s: %s",
+                  _openslide_object_ref_get_debug_name(entry->ref),
+                  tmp_err->message);
       }
       g_error_free(tmp_err);
       continue;
@@ -1123,19 +1139,17 @@ static bool dicom_open(openslide_t *osr,
     if (!g_str_equal(f->slide_id, slide_id)) {
       if (_openslide_debug(OPENSLIDE_DEBUG_SEARCH)) {
         g_message("opening %s: Series Instance UID %s != %s",
-                  path, f->slide_id, slide_id);
+                  _openslide_object_ref_get_debug_name(entry->ref),
+                  f->slide_id, slide_id);
       }
       continue;
     }
 
     if (!maybe_add_file(osr, level_array, g_steal_pointer(&f), err)) {
-      g_prefix_error(err, "Reading %s: ", path);
+      g_prefix_error(err, "Reading %s: ",
+                     _openslide_object_ref_get_debug_name(entry->ref));
       return false;
     }
-  }
-  if (dir_err) {
-    g_propagate_error(err, dir_err);
-    return false;
   }
 
   if (level_array->len == 0) {
