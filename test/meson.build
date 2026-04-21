@@ -12,6 +12,11 @@ storage_primitives_deps += (azure_dep.found() ? [azure_dep] : [])
 storage_primitives = executable(
   'storage-primitives',
   'storage-primitives.c',
+  '../src/openslide-storage-cloud.c',
+  '../src/openslide-storage-local.c',
+  '../src/openslide-storage-s3.c',
+  '../src/openslide-storage-gcs.c',
+  '../src/openslide-storage-azure.c',
   '../src/openslide-storage.c',
   '../src/openslide-error.c',
   dependencies : storage_primitives_deps,
