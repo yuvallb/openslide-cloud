@@ -243,6 +243,9 @@ struct _openslide_storage_provider *_openslide_get_local_provider(void);
 bool _openslide_object_ref_from_local_path(const char *path,
                                            struct _openslide_object_ref **out,
                                            GError **err);
+void _openslide_open_scope_enter(const struct _openslide_object_ref *ref);
+void _openslide_open_scope_leave(void);
+const struct _openslide_object_ref *_openslide_open_scope_get_current_ref(void);
 struct _openslide_object_ref *_openslide_object_ref_ref(struct _openslide_object_ref *ref);
 void _openslide_object_ref_unref(struct _openslide_object_ref *ref);
 const char *_openslide_object_ref_get_debug_name(const struct _openslide_object_ref *ref);

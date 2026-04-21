@@ -144,10 +144,16 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     struct curl_slist *headers = NULL;
     if (settings->bearer_token && settings->bearer_token[0]) {
       g_autofree char *auth = g_strdup_printf("Authorization: Bearer %s", settings->bearer_token);
-      headers = curl_slist_append(headers, auth);
+      if (!cloud_headers_append(&headers, auth, "GCS request", err)) {
+        curl_easy_cleanup(curl);
+        return false;
+      }
     }
     if (range_header) {
-      headers = curl_slist_append(headers, range_header);
+      if (!cloud_headers_append(&headers, range_header, "GCS request", err)) {
+        curl_easy_cleanup(curl);
+        return false;
+      }
     }
 
     struct cloud_grow_ctx grow = {0};

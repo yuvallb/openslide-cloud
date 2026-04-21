@@ -26,6 +26,29 @@
 
 #include <string.h>
 
+static void open_scope_stack_destroy(gpointer data) {
+  GPtrArray *stack = data;
+  if (!stack) {
+    return;
+  }
+
+  for (guint i = 0; i < stack->len; i++) {
+    _openslide_object_ref_unref(g_ptr_array_index(stack, i));
+  }
+  g_ptr_array_free(stack, true);
+}
+
+static GPrivate open_scope_stack = G_PRIVATE_INIT(open_scope_stack_destroy);
+
+static GPtrArray *get_open_scope_stack(void) {
+  GPtrArray *stack = g_private_get(&open_scope_stack);
+  if (!stack) {
+    stack = g_ptr_array_new();
+    g_private_set(&open_scope_stack, stack);
+  }
+  return stack;
+}
+
 struct _openslide_object_ref *new_object_ref(struct _openslide_storage_provider *provider,
                                              const char *debug_name,
                                              gpointer provider_data,
@@ -110,6 +133,13 @@ bool _openslide_object_ref_from_uri(const char *uri,
 bool _openslide_object_ref_from_local_path(const char *path,
                                            struct _openslide_object_ref **out,
                                            GError **err) {
+  const struct _openslide_object_ref *current_ref =
+    _openslide_open_scope_get_current_ref();
+  if (current_ref && g_str_equal(path, _openslide_object_ref_get_debug_name(current_ref))) {
+    *out = _openslide_object_ref_ref((struct _openslide_object_ref *) current_ref);
+    return true;
+  }
+
   if (g_str_has_prefix(path, "file://") ||
       g_str_has_prefix(path, "s3://") ||
       g_str_has_prefix(path, "gs://") ||
@@ -121,6 +151,29 @@ bool _openslide_object_ref_from_local_path(const char *path,
                                                                 path,
                                                                 out,
                                                                 err);
+}
+
+void _openslide_open_scope_enter(const struct _openslide_object_ref *ref) {
+  g_ptr_array_add(get_open_scope_stack(),
+                  _openslide_object_ref_ref((struct _openslide_object_ref *) ref));
+}
+
+void _openslide_open_scope_leave(void) {
+  GPtrArray *stack = g_private_get(&open_scope_stack);
+  g_return_if_fail(stack && stack->len > 0);
+
+  struct _openslide_object_ref *ref = g_ptr_array_index(stack, stack->len - 1);
+  g_ptr_array_remove_index(stack, stack->len - 1);
+  _openslide_object_ref_unref(ref);
+}
+
+const struct _openslide_object_ref *_openslide_open_scope_get_current_ref(void) {
+  GPtrArray *stack = g_private_get(&open_scope_stack);
+  if (!stack || stack->len == 0) {
+    return NULL;
+  }
+
+  return g_ptr_array_index(stack, stack->len - 1);
 }
 
 struct _openslide_object_ref *_openslide_object_ref_ref(struct _openslide_object_ref *ref) {

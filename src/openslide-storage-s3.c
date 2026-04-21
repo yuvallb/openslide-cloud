@@ -75,6 +75,8 @@ static void s3_settings_unref(struct s3_settings *settings) {
   g_queue_free_full(settings->range_lru, g_free);
   g_mutex_clear(&settings->metadata_cache_mutex);
   g_mutex_clear(&settings->range_cache_mutex);
+  g_mutex_clear(&settings->request_limit_mutex);
+  g_cond_clear(&settings->request_limit_cond);
   g_free(settings->region);
   g_free(settings->endpoint);
   g_free(settings->access_key_id);
@@ -130,6 +132,8 @@ static struct s3_settings *s3_settings_new(const struct _openslide_open_options 
                                                     g_str_equal,
                                                     g_free,
                                                     s3_inflight_entry_free);
+  g_mutex_init(&settings->request_limit_mutex);
+  g_cond_init(&settings->request_limit_cond);
   return settings;
 }
 
@@ -170,6 +174,16 @@ static char *s3_uri_encode_path(const char *key) {
     }
   }
   return g_string_free(g_steal_pointer(&result), false);
+}
+
+char *_openslide_s3_build_request_path(const char *bucket,
+                                       const char *key,
+                                       bool path_style) {
+  g_autofree char *escaped_key = s3_uri_encode_path(key);
+  if (path_style) {
+    return g_strdup_printf("/%s%s", bucket, escaped_key);
+  }
+  return g_steal_pointer(&escaped_key);
 }
 
 static char *s3_hex(const uint8_t *buf, gsize len) {
@@ -221,8 +235,10 @@ static bool s3_sign_headers(const struct s3_settings *settings,
   const char *empty_payload_hash =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
   if (!s3_should_sign(settings)) {
-    *headers = curl_slist_append(*headers, "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-    return true;
+    return cloud_headers_append(headers,
+                                "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                "S3 request",
+                                err);
   }
 
   char amz_date[17];
@@ -283,20 +299,44 @@ static bool s3_sign_headers(const struct s3_settings *settings,
   g_autofree char *date_header = g_strdup_printf("x-amz-date: %s", amz_date);
   g_autofree char *payload_header = g_strdup_printf("x-amz-content-sha256: %s", empty_payload_hash);
 
-  *headers = curl_slist_append(*headers, date_header);
-  *headers = curl_slist_append(*headers, payload_header);
-  *headers = curl_slist_append(*headers, authorization);
+  if (!cloud_headers_append(headers, date_header, "S3 request", err) ||
+      !cloud_headers_append(headers, payload_header, "S3 request", err) ||
+      !cloud_headers_append(headers, authorization, "S3 request", err)) {
+    return false;
+  }
   if (settings->session_token && settings->session_token[0]) {
     g_autofree char *token_header =
       g_strdup_printf("x-amz-security-token: %s", settings->session_token);
-    *headers = curl_slist_append(*headers, token_header);
-  }
-  if (!*headers) {
-    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
-                "Unable to allocate curl headers for S3 request");
-    return false;
+    if (!cloud_headers_append(headers, token_header, "S3 request", err)) {
+      return false;
+    }
   }
   return true;
+}
+
+static void s3_request_slot_acquire(struct s3_settings *settings) {
+  if (settings->max_parallel_requests == 0) {
+    return;
+  }
+
+  g_mutex_lock(&settings->request_limit_mutex);
+  while (settings->active_requests >= settings->max_parallel_requests) {
+    g_cond_wait(&settings->request_limit_cond, &settings->request_limit_mutex);
+  }
+  settings->active_requests++;
+  g_mutex_unlock(&settings->request_limit_mutex);
+}
+
+static void s3_request_slot_release(struct s3_settings *settings) {
+  if (settings->max_parallel_requests == 0) {
+    return;
+  }
+
+  g_mutex_lock(&settings->request_limit_mutex);
+  g_assert(settings->active_requests > 0);
+  settings->active_requests--;
+  g_cond_signal(&settings->request_limit_cond);
+  g_mutex_unlock(&settings->request_limit_mutex);
 }
 
 static char *s3_range_key(const struct s3_object_ref_data *obj,
@@ -425,26 +465,25 @@ static bool s3_do_request(const struct s3_settings *settings,
                           GError **err) {
   g_autofree char *host = NULL;
   g_autofree char *url = NULL;
+  g_autofree char *request_path = NULL;
   if (settings->endpoint && settings->endpoint[0]) {
     host = g_strdup(settings->endpoint);
-    g_autofree char *escaped_key = s3_uri_encode_path(key);
-    url = g_strdup_printf("https://%s/%s%s%s%s",
+    request_path = _openslide_s3_build_request_path(bucket, key, true);
+    url = g_strdup_printf("https://%s%s%s%s",
                           settings->endpoint,
-                          bucket,
-                          escaped_key,
+                          request_path,
                           query ? "?" : "",
                           query ? query : "");
   } else {
     host = g_strdup_printf("%s.s3.amazonaws.com", bucket);
-    g_autofree char *escaped_key = s3_uri_encode_path(key);
+    request_path = _openslide_s3_build_request_path(bucket, key, false);
     url = g_strdup_printf("https://%s%s%s%s",
                           host,
-                          escaped_key,
+                          request_path,
                           query ? "?" : "",
                           query ? query : "");
   }
 
-  g_autofree char *canonical_uri = s3_uri_encode_path(key);
   uint32_t retries = settings->max_retries;
   for (uint32_t attempt = 0; attempt <= retries; attempt++) {
     CURL *curl = curl_easy_init();
@@ -458,7 +497,7 @@ static bool s3_do_request(const struct s3_settings *settings,
     if (!s3_sign_headers(settings,
                          method,
                          host,
-                         canonical_uri,
+                         request_path,
                          query,
                          &headers,
                          err)) {
@@ -466,7 +505,10 @@ static bool s3_do_request(const struct s3_settings *settings,
       return false;
     }
     if (range_header) {
-      headers = curl_slist_append(headers, range_header);
+      if (!cloud_headers_append(&headers, range_header, "S3 request", err)) {
+        curl_easy_cleanup(curl);
+        return false;
+      }
     }
 
     struct cloud_grow_ctx grow = {0};
@@ -480,6 +522,7 @@ static bool s3_do_request(const struct s3_settings *settings,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &grow);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "openslide/4.1 s3-provider");
 
+    s3_request_slot_acquire((struct s3_settings *) settings);
     CURLcode cc = curl_easy_perform(curl);
     long status = 0;
     double content_length = -1;
@@ -487,6 +530,7 @@ static bool s3_do_request(const struct s3_settings *settings,
     curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &content_length);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
+    s3_request_slot_release((struct s3_settings *) settings);
 
     if (cc == CURLE_OK && (status >= 200 && status < 300)) {
       result->http_status = status;

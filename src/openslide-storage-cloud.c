@@ -61,4 +61,22 @@ void cloud_init_curl_once(void) {
   }
 }
 
+bool cloud_headers_append(struct curl_slist **headers,
+                          const char *header,
+                          const char *context,
+                          GError **err) {
+  struct curl_slist *tmp = curl_slist_append(*headers, header);
+  if (!tmp) {
+    curl_slist_free_all(*headers);
+    *headers = NULL;
+    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                "Unable to allocate curl headers for %s",
+                context);
+    return false;
+  }
+
+  *headers = tmp;
+  return true;
+}
+
 #endif

@@ -31,6 +31,7 @@
 #include <glib/gstdio.h>
 
 #include "openslide-private.h"
+#include "openslide-storage-internal.h"
 
 struct fixture {
   char *dir;
@@ -311,6 +312,200 @@ static void test_azure_uri_parsing_and_child_resolution(void) {
 #endif
 }
 
+static void test_public_source_api(const struct fixture *fx) {
+  g_autofree char *file_uri = g_strdup_printf("file://%s", fx->base_file);
+
+  openslide_source_t *source = openslide_source_create_uri(file_uri);
+  assert_true(source != NULL, "file:// source creation should succeed");
+
+  openslide_open_options_t *opts = openslide_open_options_create();
+  assert_true(opts != NULL, "open options creation should succeed");
+
+  openslide_t *osr = openslide_open_uri(file_uri);
+  assert_true(osr == NULL, "open_uri should return NULL for non-slide input");
+
+  osr = openslide_open_with_options(source, opts);
+  assert_true(osr == NULL,
+              "open_with_options should return NULL for non-slide input");
+
+  openslide_open_options_destroy(opts);
+  openslide_source_destroy(source);
+
+  source = openslide_source_create_uri("bogus://example/path");
+  assert_true(source == NULL,
+              "unsupported URI schemes should be rejected at source creation");
+}
+
+#ifdef HAVE_S3_PROVIDER
+static void test_s3_scope_reuses_root_ref_settings(void) {
+  openslide_open_options_t *opts = openslide_open_options_create();
+  assert_true(opts != NULL, "open options creation should succeed");
+  openslide_open_options_set_connection_timeout(opts, 1111);
+  openslide_open_options_set_read_timeout(opts, 2222);
+  openslide_open_options_set_max_retries(opts, 7);
+  openslide_open_options_set_max_parallel_requests(opts, 3);
+  openslide_open_options_set_storage_cache_size(opts, 123456);
+
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  assert_true(_openslide_object_ref_from_uri("s3://bucket/path/to/slide.czi",
+                                             opts,
+                                             &ref,
+                                             NULL),
+              "S3 URI parsing should succeed");
+
+  _openslide_open_scope_enter(ref);
+
+  g_autoptr(_openslide_object_ref) same_ref = NULL;
+  assert_true(_openslide_object_ref_from_local_path("s3://bucket/path/to/slide.czi",
+                                                    &same_ref,
+                                                    NULL),
+              "path conversion should reuse the in-scope S3 root ref");
+
+  const struct s3_object_ref_data *root_data = ref->provider_data;
+  const struct s3_object_ref_data *same_data = same_ref->provider_data;
+  assert_true(root_data->settings == same_data->settings,
+              "scoped S3 ref reuse should preserve provider settings");
+  assert_true(root_data->settings->connection_timeout_ms == 1111,
+              "S3 connection timeout should be preserved");
+  assert_true(root_data->settings->read_timeout_ms == 2222,
+              "S3 read timeout should be preserved");
+  assert_true(root_data->settings->max_retries == 7,
+              "S3 retry count should be preserved");
+  assert_true(root_data->settings->max_parallel_requests == 3,
+              "S3 max_parallel_requests should be preserved");
+  assert_true(root_data->settings->storage_cache_bytes == 123456,
+              "S3 storage cache size should be preserved");
+
+  g_autoptr(_openslide_object_ref) child = NULL;
+  assert_true(_openslide_object_ref_resolve_child(same_ref,
+                                                  "macro.jpg",
+                                                  &child,
+                                                  NULL),
+              "resolve_child should succeed from reused S3 ref");
+  const struct s3_object_ref_data *child_data = child->provider_data;
+  assert_true(child_data->settings == root_data->settings,
+              "S3 child refs should inherit original provider settings");
+
+  _openslide_open_scope_leave();
+  openslide_open_options_destroy(opts);
+}
+
+static void test_s3_request_path_generation(void) {
+  g_autofree char *host_style =
+    _openslide_s3_build_request_path("bucket", "dir/slide one.svs", false);
+  assert_true(g_str_equal(host_style, "/dir/slide%20one.svs"),
+              "host-style S3 requests should sign only the object path");
+
+  g_autofree char *path_style =
+    _openslide_s3_build_request_path("bucket", "dir/slide one.svs", true);
+  assert_true(g_str_equal(path_style, "/bucket/dir/slide%20one.svs"),
+              "path-style S3 requests should sign the bucket-qualified path");
+
+  g_autofree char *empty_key =
+    _openslide_s3_build_request_path("bucket", "", true);
+  assert_true(g_str_equal(empty_key, "/bucket/"),
+              "path-style S3 requests should preserve the trailing slash for empty keys");
+}
+#endif
+
+#ifdef HAVE_GCS_PROVIDER
+static void test_gcs_scope_reuses_root_ref_settings(void) {
+  openslide_open_options_t *opts = openslide_open_options_create();
+  assert_true(opts != NULL, "open options creation should succeed");
+  openslide_open_options_set_connection_timeout(opts, 3333);
+  openslide_open_options_set_read_timeout(opts, 4444);
+  openslide_open_options_set_max_retries(opts, 9);
+
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  assert_true(_openslide_object_ref_from_uri("gs://bucket/path/to/slide.czi",
+                                             opts,
+                                             &ref,
+                                             NULL),
+              "GCS URI parsing should succeed");
+
+  _openslide_open_scope_enter(ref);
+
+  g_autoptr(_openslide_object_ref) same_ref = NULL;
+  assert_true(_openslide_object_ref_from_local_path("gs://bucket/path/to/slide.czi",
+                                                    &same_ref,
+                                                    NULL),
+              "path conversion should reuse the in-scope GCS root ref");
+
+  const struct gcs_object_ref_data *root_data = ref->provider_data;
+  const struct gcs_object_ref_data *same_data = same_ref->provider_data;
+  assert_true(root_data->settings == same_data->settings,
+              "scoped GCS ref reuse should preserve provider settings");
+  assert_true(root_data->settings->connection_timeout_ms == 3333,
+              "GCS connection timeout should be preserved");
+  assert_true(root_data->settings->read_timeout_ms == 4444,
+              "GCS read timeout should be preserved");
+  assert_true(root_data->settings->max_retries == 9,
+              "GCS retry count should be preserved");
+
+  g_autoptr(_openslide_object_ref) child = NULL;
+  assert_true(_openslide_object_ref_resolve_child(same_ref,
+                                                  "macro.jpg",
+                                                  &child,
+                                                  NULL),
+              "resolve_child should succeed from reused GCS ref");
+  const struct gcs_object_ref_data *child_data = child->provider_data;
+  assert_true(child_data->settings == root_data->settings,
+              "GCS child refs should inherit original provider settings");
+
+  _openslide_open_scope_leave();
+  openslide_open_options_destroy(opts);
+}
+#endif
+
+#ifdef HAVE_AZURE_PROVIDER
+static void test_azure_scope_reuses_root_ref_settings(void) {
+  openslide_open_options_t *opts = openslide_open_options_create();
+  assert_true(opts != NULL, "open options creation should succeed");
+  openslide_open_options_set_connection_timeout(opts, 5555);
+  openslide_open_options_set_read_timeout(opts, 6666);
+  openslide_open_options_set_max_retries(opts, 4);
+
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  assert_true(_openslide_object_ref_from_uri("az://acct/container/path/to/slide.czi",
+                                             opts,
+                                             &ref,
+                                             NULL),
+              "Azure URI parsing should succeed");
+
+  _openslide_open_scope_enter(ref);
+
+  g_autoptr(_openslide_object_ref) same_ref = NULL;
+  assert_true(_openslide_object_ref_from_local_path("az://acct/container/path/to/slide.czi",
+                                                    &same_ref,
+                                                    NULL),
+              "path conversion should reuse the in-scope Azure root ref");
+
+  const struct azure_object_ref_data *root_data = ref->provider_data;
+  const struct azure_object_ref_data *same_data = same_ref->provider_data;
+  assert_true(root_data->settings == same_data->settings,
+              "scoped Azure ref reuse should preserve provider settings");
+  assert_true(root_data->settings->connection_timeout_ms == 5555,
+              "Azure connection timeout should be preserved");
+  assert_true(root_data->settings->read_timeout_ms == 6666,
+              "Azure read timeout should be preserved");
+  assert_true(root_data->settings->max_retries == 4,
+              "Azure retry count should be preserved");
+
+  g_autoptr(_openslide_object_ref) child = NULL;
+  assert_true(_openslide_object_ref_resolve_child(same_ref,
+                                                  "macro.jpg",
+                                                  &child,
+                                                  NULL),
+              "resolve_child should succeed from reused Azure ref");
+  const struct azure_object_ref_data *child_data = child->provider_data;
+  assert_true(child_data->settings == root_data->settings,
+              "Azure child refs should inherit original provider settings");
+
+  _openslide_open_scope_leave();
+  openslide_open_options_destroy(opts);
+}
+#endif
+
 int main(int argc, char **argv) {
   (void) argc;
   (void) argv;
@@ -321,6 +516,17 @@ int main(int argc, char **argv) {
   test_list_children_semantics(&fx);
   test_gcs_uri_parsing_and_child_resolution();
   test_azure_uri_parsing_and_child_resolution();
+  test_public_source_api(&fx);
+#ifdef HAVE_S3_PROVIDER
+  test_s3_scope_reuses_root_ref_settings();
+  test_s3_request_path_generation();
+#endif
+#ifdef HAVE_GCS_PROVIDER
+  test_gcs_scope_reuses_root_ref_settings();
+#endif
+#ifdef HAVE_AZURE_PROVIDER
+  test_azure_scope_reuses_root_ref_settings();
+#endif
   teardown_fixture(&fx);
   return 0;
 }

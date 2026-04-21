@@ -157,6 +157,9 @@ struct s3_settings {
   GQueue *range_lru;
   uint64_t range_cache_current_bytes;
   GHashTable *inflight_ranges;
+  GMutex request_limit_mutex;
+  GCond request_limit_cond;
+  uint32_t active_requests;
 };
 
 struct s3_object_ref_data {
@@ -176,6 +179,10 @@ struct s3_http_result {
   size_t body_len;
   int64_t content_length;
 };
+
+char *_openslide_s3_build_request_path(const char *bucket,
+                                       const char *key,
+                                       bool path_style);
 #endif
 
 #ifdef HAVE_GCS_PROVIDER
@@ -260,6 +267,10 @@ size_t cloud_grow_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 bool cloud_is_retryable_curl(CURLcode code);
 bool cloud_is_retryable_http(long status);
 void cloud_init_curl_once(void);
+bool cloud_headers_append(struct curl_slist **headers,
+                          const char *header,
+                          const char *context,
+                          GError **err);
 
 #endif
 

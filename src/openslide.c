@@ -477,6 +477,8 @@ static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref 
                                              const openslide_open_options_t *opts G_GNUC_UNUSED) {
   g_assert(openslide_was_dynamically_loaded);
 
+  _openslide_open_scope_enter(ref);
+
   // Get the filename for format detection and backend open
   // This works for local files; remote providers will need special handling
   const char *filename = _openslide_object_ref_to_filename(ref);
@@ -486,6 +488,7 @@ static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref 
   const struct _openslide_format *format = detect_format(filename, &tl);
   if (!format) {
     // not a slide file
+    _openslide_open_scope_leave();
     return NULL;
   }
 
@@ -505,6 +508,7 @@ static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref 
     g_set_error(&tmp_err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "pixman 0.38.x does not render correctly; upgrade or downgrade pixman");
     _openslide_propagate_error(osr, tmp_err);
+    _openslide_open_scope_leave();
     return g_steal_pointer(&osr);
   }
 
@@ -514,6 +518,7 @@ static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref 
   if (!open_backend(osr, format, filename, tl, quickhash1, &tmp_err)) {
     // failed to read slide
     _openslide_propagate_error(osr, tmp_err);
+    _openslide_open_scope_leave();
     return g_steal_pointer(&osr);
   }
   g_assert(osr->levels);
@@ -540,6 +545,7 @@ static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref 
     if (osr->levels[i]->downsample < osr->levels[i - 1]->downsample) {
       g_warning("Downsampled images not correctly ordered: %g < %g",
                 osr->levels[i]->downsample, osr->levels[i - 1]->downsample);
+      _openslide_open_scope_leave();
       return NULL;
     }
   }
@@ -638,6 +644,7 @@ static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref 
     osr->cache = _openslide_cache_binding_create(cache_size);
   }
 
+  _openslide_open_scope_leave();
   return g_steal_pointer(&osr);
 }
 
