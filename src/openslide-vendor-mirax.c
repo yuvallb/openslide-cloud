@@ -403,7 +403,7 @@ static bool mirax_detect(const char *filename, struct _openslide_tifflike *tl,
   g_autofree char *bundle_path =
     g_strndup(filename, strlen(filename) - strlen(MRXS_EXT));
   g_autoptr(_openslide_object_ref) bundle_ref = NULL;
-  if (!_openslide_object_ref_from_local_path(bundle_path, &bundle_ref, err)) {
+  if (!_openslide_object_ref_from_local_path(bundle_path, NULL, &bundle_ref, err)) {
     return false;
   }
   g_autoptr(_openslide_object_ref) slidedat_ref = NULL;
@@ -1387,7 +1387,7 @@ static bool mirax_open(openslide_t *osr, const char *filename,
   g_autofree char *bundle_path =
     g_strndup(filename, strlen(filename) - strlen(MRXS_EXT));
   g_autoptr(_openslide_object_ref) bundle_ref = NULL;
-  if (!_openslide_object_ref_from_local_path(bundle_path, &bundle_ref, err)) {
+  if (!_openslide_object_ref_from_local_path(bundle_path, NULL, &bundle_ref, err)) {
     return false;
   }
 

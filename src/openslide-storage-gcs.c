@@ -32,6 +32,17 @@ static struct _openslide_storage_provider gcs_provider = {
   .ops = &gcs_provider_ops,
 };
 
+static void secure_zero_free(char *secret) {
+  if (!secret) {
+    return;
+  }
+  volatile char *p = secret;
+  while (*p != '\0') {
+    *p++ = '\0';
+  }
+  g_free(secret);
+}
+
 static struct gcs_settings *gcs_settings_ref(struct gcs_settings *settings) {
   g_atomic_int_inc(&settings->refcount);
   return settings;
@@ -45,7 +56,7 @@ static void gcs_settings_unref(struct gcs_settings *settings) {
     return;
   }
   g_free(settings->endpoint);
-  g_free(settings->bearer_token);
+  secure_zero_free(settings->bearer_token);
   g_free(settings);
 }
 
@@ -162,7 +173,9 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     if (headers) {
       curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     }
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    bool has_auth_headers = settings->bearer_token && settings->bearer_token[0];
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,
+                     cloud_should_follow_redirect(has_auth_headers) ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long) settings->connection_timeout_ms);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long) settings->read_timeout_ms);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cloud_grow_write_cb);

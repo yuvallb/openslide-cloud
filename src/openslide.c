@@ -201,164 +201,20 @@ static const char **strv_from_hashtable_keys(GHashTable *h) {
   return result;
 }
 
+static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref *ref,
+                                             const openslide_open_options_t *opts G_GNUC_UNUSED);
+
 openslide_t *openslide_open(const char *filename) {
   g_assert(openslide_was_dynamically_loaded);
 
-  // detect format
-  g_autoptr(_openslide_tifflike) tl = NULL;
-  const struct _openslide_format *format = detect_format(filename, &tl);
-  if (!format) {
-    // not a slide file
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  GError *tmp_err = NULL;
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &ref, &tmp_err)) {
+    g_clear_error(&tmp_err);
     return NULL;
   }
 
-  // alloc memory
-  g_autoptr(openslide_t) osr = g_new0(openslide_t, 1);
-  osr->properties = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                          g_free, g_free);
-  osr->associated_images = g_hash_table_new_full(g_str_hash, g_str_equal,
-                                                 g_free,
-                                                 OPENSLIDE_G_DESTROY_NOTIFY_WRAPPER(destroy_associated_image));
-
-  // refuse to run on unpatched pixman 0.38.x
-  static GOnce pixman_once = G_ONCE_INIT;
-  g_once(&pixman_once, verify_pixman_works, NULL);
-  if (!GPOINTER_TO_INT(pixman_once.retval)) {
-    GError *tmp_err = NULL;
-    g_set_error(&tmp_err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
-                "pixman 0.38.x does not render correctly; upgrade or downgrade pixman");
-    _openslide_propagate_error(osr, tmp_err);
-    return g_steal_pointer(&osr);
-  }
-
-  // open backend
-  g_autoptr(_openslide_hash) quickhash1 = _openslide_hash_quickhash1_create();
-  GError *tmp_err = NULL;
-  if (!open_backend(osr, format, filename, tl, quickhash1, &tmp_err)) {
-    // failed to read slide
-    _openslide_propagate_error(osr, tmp_err);
-    return g_steal_pointer(&osr);
-  }
-  g_assert(osr->levels);
-
-  // compute downsamples if not done already
-  int64_t blw, blh;
-  openslide_get_level0_dimensions(osr, &blw, &blh);
-
-  if (osr->level_count && osr->levels[0]->downsample == 0) {
-    osr->levels[0]->downsample = 1.0;
-  }
-  for (int32_t i = 1; i < osr->level_count; i++) {
-    struct _openslide_level *l = osr->levels[i];
-    if (l->downsample == 0) {
-      l->downsample =
-        (((double) blh / (double) l->h) +
-         ((double) blw / (double) l->w)) / 2.0;
-    }
-  }
-
-  // check downsamples
-  for (int32_t i = 1; i < osr->level_count; i++) {
-    //g_debug("downsample: %g", osr->levels[i]->downsample);
-
-    if (osr->levels[i]->downsample < osr->levels[i - 1]->downsample) {
-      g_warning("Downsampled images not correctly ordered: %g < %g",
-		osr->levels[i]->downsample, osr->levels[i - 1]->downsample);
-      return NULL;
-    }
-  }
-
-  // set hash property
-  const char *hash_str = _openslide_hash_get_string(quickhash1);
-  if (hash_str != NULL) {
-    g_hash_table_insert(osr->properties,
-                        g_strdup(OPENSLIDE_PROPERTY_NAME_QUICKHASH1),
-                        g_strdup(hash_str));
-  }
-
-  // set other properties
-  g_hash_table_insert(osr->properties,
-                      g_strdup(OPENSLIDE_PROPERTY_NAME_VENDOR),
-                      g_strdup(format->vendor));
-  if (osr->icc_profile_size) {
-    g_hash_table_insert(osr->properties,
-                        g_strdup(OPENSLIDE_PROPERTY_NAME_ICC_SIZE),
-                        g_strdup_printf("%"PRId64, osr->icc_profile_size));
-  }
-  g_hash_table_insert(osr->properties,
-		      g_strdup(_OPENSLIDE_PROPERTY_NAME_LEVEL_COUNT),
-		      g_strdup_printf("%d", osr->level_count));
-  bool should_have_geometry = false;  // initialize for gcc 4.4
-  for (int32_t i = 0; i < osr->level_count; i++) {
-    struct _openslide_level *l = osr->levels[i];
-
-    g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_WIDTH, i),
-			g_strdup_printf("%"PRId64, l->w));
-    g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_HEIGHT, i),
-			g_strdup_printf("%"PRId64, l->h));
-    g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_DOWNSAMPLE, i),
-			_openslide_format_double(l->downsample));
-
-    // tile geometry
-    bool have_geometry = (l->tile_w > 0 && l->tile_h > 0);
-    if (i == 0) {
-      should_have_geometry = have_geometry;
-    }
-    if (have_geometry != should_have_geometry) {
-      g_warning("Inconsistent tile geometry hints between levels");
-    }
-    if (have_geometry) {
-      g_hash_table_insert(osr->properties,
-                          g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_TILE_WIDTH, i),
-                          g_strdup_printf("%"PRId64, l->tile_w));
-      g_hash_table_insert(osr->properties,
-                          g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_TILE_HEIGHT, i),
-                          g_strdup_printf("%"PRId64, l->tile_h));
-    }
-  }
-
-  // fill in associated image names and set properties
-  osr->associated_image_names = strv_from_hashtable_keys(osr->associated_images);
-  for (const char **name = osr->associated_image_names; *name != NULL; name++) {
-    struct _openslide_associated_image *img =
-      g_hash_table_lookup(osr->associated_images, *name);
-    g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_ASSOCIATED_WIDTH, *name),
-			g_strdup_printf("%"PRId64, img->w));
-    g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_ASSOCIATED_HEIGHT, *name),
-			g_strdup_printf("%"PRId64, img->h));
-    if (img->icc_profile_size) {
-      g_hash_table_insert(osr->properties,
-                          g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_ASSOCIATED_ICC_SIZE, *name),
-                          g_strdup_printf("%"PRId64, img->icc_profile_size));
-    }
-  }
-
-  // ensure NULL values don't leak into properties
-  GHashTableIter iter;
-  char *name;
-  char *value;
-  g_hash_table_iter_init(&iter, osr->properties);
-  while (g_hash_table_iter_next(&iter, (void *) &name, (void *) &value)) {
-    if (!value) {
-      g_warning("Property \"%s\" has NULL value", name);
-      g_hash_table_iter_remove(&iter);
-    }
-  }
-
-  // fill in property names
-  osr->property_names = strv_from_hashtable_keys(osr->properties);
-
-  // start cache if the backend hasn't already done it
-  if (!osr->cache) {
-    osr->cache = _openslide_cache_binding_create(DEFAULT_CACHE_SIZE);
-  }
-
-  return g_steal_pointer(&osr);
+  return _openslide_open_with_ref(ref, NULL);
 }
 
 // Internal helper to parse URIs and create object references
@@ -700,7 +556,10 @@ openslide_t *openslide_open_with_options(const openslide_source_t *source,
 
   switch (source->kind) {
   case _OPENSLIDE_SOURCE_KIND_PATH:
-    ok = _openslide_object_ref_from_local_path(source->value, &ref, &tmp_err);
+    ok = _openslide_object_ref_from_local_path(source->value,
+                           effective_opts,
+                           &ref,
+                           &tmp_err);
     break;
   case _OPENSLIDE_SOURCE_KIND_URI:
     ok = _openslide_object_ref_from_uri(source->value, effective_opts, &ref, &tmp_err);

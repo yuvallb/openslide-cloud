@@ -482,7 +482,7 @@ bool _openslide_jpeg_add_associated_image(openslide_t *osr,
 
   // Phase 3: Create provider-backed reference
   g_autoptr(GError) ref_err = NULL;
-  if (_openslide_object_ref_from_local_path(filename, &img->ref, &ref_err)) {
+  if (_openslide_object_ref_from_local_path(filename, NULL, &img->ref, &ref_err)) {
     img->use_ref = true;
   } else {
     g_debug("Couldn't create object_ref for JPEG associated image: %s",

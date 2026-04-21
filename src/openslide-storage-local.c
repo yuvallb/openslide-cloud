@@ -78,7 +78,7 @@ static bool local_from_local_path(struct _openslide_storage_provider *provider,
                                   const char *path,
                                   struct _openslide_object_ref **out,
                                   GError **err) {
-  if (!path || !path[0]) {
+  if (!path) {
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "Empty path");
     return false;

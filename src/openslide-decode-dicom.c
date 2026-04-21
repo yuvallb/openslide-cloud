@@ -112,7 +112,7 @@ static DcmIO *vfs_open(DcmError **dcm_error, void *client) {
 
   // Best effort object_ref for provider-backed reads.
   g_autoptr(GError) ref_err = NULL;
-  if (!_openslide_object_ref_from_local_path(client, &dio->ref, &ref_err)) {
+  if (!_openslide_object_ref_from_local_path(client, NULL, &dio->ref, &ref_err)) {
     dio->ref = NULL;
   }
 
@@ -146,6 +146,7 @@ static int64_t vfs_read_readable(DcmError **dcm_error, DcmIO *io,
   struct _openslide_dicom_io *dio = (struct _openslide_dicom_io *) io;
   GError *tmp_err = NULL;
   if (!ensure_readable(dio, &tmp_err)) {
+    g_clear_error(&tmp_err);
     // Fall back to file-based reading
     return vfs_read(dcm_error, io, buffer, length);
   }

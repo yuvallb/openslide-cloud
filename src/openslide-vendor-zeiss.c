@@ -1379,7 +1379,7 @@ static bool zeiss_open(openslide_t *osr, const char *filename,
                        struct _openslide_tifflike *tl G_GNUC_UNUSED,
                        struct _openslide_hash *quickhash1, GError **err) {
   g_autoptr(_openslide_object_ref) root_ref = NULL;
-  if (!_openslide_object_ref_from_local_path(filename, &root_ref, err)) {
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &root_ref, err)) {
     return false;
   }
 

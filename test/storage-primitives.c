@@ -106,7 +106,7 @@ static void teardown_fixture(struct fixture *fx) {
 
 static void test_short_read_and_eof(const struct fixture *fx) {
   g_autoptr(_openslide_object_ref) ref = NULL;
-  assert_true(_openslide_object_ref_from_local_path(fx->base_file, &ref, NULL),
+  assert_true(_openslide_object_ref_from_local_path(fx->base_file, NULL, &ref, NULL),
               "object ref from file path should succeed");
 
   g_autoptr(_openslide_readable) readable = _openslide_readable_open(ref, NULL);
@@ -139,8 +139,7 @@ static void test_short_read_and_eof(const struct fixture *fx) {
 
 static void test_resolve_child_semantics(const struct fixture *fx) {
   g_autoptr(_openslide_object_ref) base_ref = NULL;
-  assert_true(_openslide_object_ref_from_local_path(fx->base_file,
-                                                     &base_ref,
+  assert_true(_openslide_object_ref_from_local_path(fx->base_file, NULL, &base_ref,
                                                      NULL),
               "object ref from file path should succeed");
 
@@ -158,7 +157,7 @@ static void test_resolve_child_semantics(const struct fixture *fx) {
               "resolve_child from file base should target sibling");
 
   g_autoptr(_openslide_object_ref) dir_ref = NULL;
-  assert_true(_openslide_object_ref_from_local_path(fx->dir, &dir_ref, NULL),
+  assert_true(_openslide_object_ref_from_local_path(fx->dir, NULL, &dir_ref, NULL),
               "object ref from directory path should succeed");
 
   g_autoptr(_openslide_object_ref) child_from_dir = NULL;
@@ -186,7 +185,7 @@ static void collect_names_into_set(GPtrArray *entries, GHashTable *set) {
 
 static void test_list_children_semantics(const struct fixture *fx) {
   g_autoptr(_openslide_object_ref) dir_ref = NULL;
-  assert_true(_openslide_object_ref_from_local_path(fx->dir, &dir_ref, NULL),
+  assert_true(_openslide_object_ref_from_local_path(fx->dir, NULL, &dir_ref, NULL),
               "object ref from directory path should succeed");
 
   g_autoptr(GPtrArray) dir_entries = NULL;
@@ -206,7 +205,7 @@ static void test_list_children_semantics(const struct fixture *fx) {
               "dir listing should include beta.dat");
 
   g_autoptr(_openslide_object_ref) file_ref = NULL;
-  assert_true(_openslide_object_ref_from_local_path(fx->base_file, &file_ref, NULL),
+  assert_true(_openslide_object_ref_from_local_path(fx->base_file, NULL, &file_ref, NULL),
               "object ref from file path should succeed");
 
   g_autoptr(GPtrArray) file_entries = NULL;
@@ -336,7 +335,69 @@ static void test_public_source_api(const struct fixture *fx) {
               "unsupported URI schemes should be rejected at source creation");
 }
 
+#if defined(HAVE_S3_PROVIDER) || defined(HAVE_GCS_PROVIDER) || defined(HAVE_AZURE_PROVIDER)
+static void test_cloud_retry_and_redirect_policies(void) {
+  assert_true(cloud_is_retryable_http(408),
+              "HTTP 408 should be retryable");
+  assert_true(cloud_is_retryable_http(429),
+              "HTTP 429 should be retryable");
+  assert_true(cloud_is_retryable_http(500),
+              "HTTP 500 should be retryable");
+  assert_true(cloud_is_retryable_http(503),
+              "HTTP 503 should be retryable");
+  assert_true(!cloud_is_retryable_http(404),
+              "HTTP 404 should not be retryable");
+
+  assert_true(cloud_is_retryable_curl(CURLE_OPERATION_TIMEDOUT),
+              "timeout should be retryable");
+  assert_true(cloud_is_retryable_curl(CURLE_COULDNT_CONNECT),
+              "connect failures should be retryable");
+  assert_true(cloud_is_retryable_curl(CURLE_RECV_ERROR),
+              "recv errors should be retryable");
+  assert_true(!cloud_is_retryable_curl(CURLE_OK),
+              "successful transfer should not be retryable");
+  assert_true(!cloud_is_retryable_curl(CURLE_HTTP_RETURNED_ERROR),
+              "generic HTTP returned error should defer to status handling");
+
+  assert_true(cloud_should_follow_redirect(false),
+              "requests without auth headers should follow redirects");
+  assert_true(!cloud_should_follow_redirect(true),
+              "requests with auth headers should not follow redirects");
+}
+#endif
+
 #ifdef HAVE_S3_PROVIDER
+static void test_s3_uri_like_path_applies_options(void) {
+  openslide_open_options_t *opts = openslide_open_options_create();
+  assert_true(opts != NULL, "open options creation should succeed");
+  openslide_open_options_set_connection_timeout(opts, 1111);
+  openslide_open_options_set_read_timeout(opts, 2222);
+  openslide_open_options_set_max_retries(opts, 7);
+  openslide_open_options_set_max_parallel_requests(opts, 3);
+  openslide_open_options_set_storage_cache_size(opts, 123456);
+
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  assert_true(_openslide_object_ref_from_local_path("s3://bucket/path/to/slide.czi",
+                                                    opts,
+                                                    &ref,
+                                                    NULL),
+              "URI-like S3 PATH should resolve via S3 provider");
+
+  const struct s3_object_ref_data *data = ref->provider_data;
+  assert_true(data->settings->connection_timeout_ms == 1111,
+              "S3 PATH source should preserve connection timeout");
+  assert_true(data->settings->read_timeout_ms == 2222,
+              "S3 PATH source should preserve read timeout");
+  assert_true(data->settings->max_retries == 7,
+              "S3 PATH source should preserve retry count");
+  assert_true(data->settings->max_parallel_requests == 3,
+              "S3 PATH source should preserve max_parallel_requests");
+  assert_true(data->settings->storage_cache_bytes == 123456,
+              "S3 PATH source should preserve storage cache size");
+
+  openslide_open_options_destroy(opts);
+}
+
 static void test_s3_scope_reuses_root_ref_settings(void) {
   openslide_open_options_t *opts = openslide_open_options_create();
   assert_true(opts != NULL, "open options creation should succeed");
@@ -356,8 +417,7 @@ static void test_s3_scope_reuses_root_ref_settings(void) {
   _openslide_open_scope_enter(ref);
 
   g_autoptr(_openslide_object_ref) same_ref = NULL;
-  assert_true(_openslide_object_ref_from_local_path("s3://bucket/path/to/slide.czi",
-                                                    &same_ref,
+  assert_true(_openslide_object_ref_from_local_path("s3://bucket/path/to/slide.czi", NULL, &same_ref,
                                                     NULL),
               "path conversion should reuse the in-scope S3 root ref");
 
@@ -409,6 +469,31 @@ static void test_s3_request_path_generation(void) {
 #endif
 
 #ifdef HAVE_GCS_PROVIDER
+static void test_gcs_uri_like_path_applies_options(void) {
+  openslide_open_options_t *opts = openslide_open_options_create();
+  assert_true(opts != NULL, "open options creation should succeed");
+  openslide_open_options_set_connection_timeout(opts, 3333);
+  openslide_open_options_set_read_timeout(opts, 4444);
+  openslide_open_options_set_max_retries(opts, 9);
+
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  assert_true(_openslide_object_ref_from_local_path("gs://bucket/path/to/slide.czi",
+                                                    opts,
+                                                    &ref,
+                                                    NULL),
+              "URI-like GCS PATH should resolve via GCS provider");
+
+  const struct gcs_object_ref_data *data = ref->provider_data;
+  assert_true(data->settings->connection_timeout_ms == 3333,
+              "GCS PATH source should preserve connection timeout");
+  assert_true(data->settings->read_timeout_ms == 4444,
+              "GCS PATH source should preserve read timeout");
+  assert_true(data->settings->max_retries == 9,
+              "GCS PATH source should preserve retry count");
+
+  openslide_open_options_destroy(opts);
+}
+
 static void test_gcs_scope_reuses_root_ref_settings(void) {
   openslide_open_options_t *opts = openslide_open_options_create();
   assert_true(opts != NULL, "open options creation should succeed");
@@ -426,8 +511,7 @@ static void test_gcs_scope_reuses_root_ref_settings(void) {
   _openslide_open_scope_enter(ref);
 
   g_autoptr(_openslide_object_ref) same_ref = NULL;
-  assert_true(_openslide_object_ref_from_local_path("gs://bucket/path/to/slide.czi",
-                                                    &same_ref,
+  assert_true(_openslide_object_ref_from_local_path("gs://bucket/path/to/slide.czi", NULL, &same_ref,
                                                     NULL),
               "path conversion should reuse the in-scope GCS root ref");
 
@@ -458,6 +542,31 @@ static void test_gcs_scope_reuses_root_ref_settings(void) {
 #endif
 
 #ifdef HAVE_AZURE_PROVIDER
+static void test_azure_uri_like_path_applies_options(void) {
+  openslide_open_options_t *opts = openslide_open_options_create();
+  assert_true(opts != NULL, "open options creation should succeed");
+  openslide_open_options_set_connection_timeout(opts, 5555);
+  openslide_open_options_set_read_timeout(opts, 6666);
+  openslide_open_options_set_max_retries(opts, 4);
+
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  assert_true(_openslide_object_ref_from_local_path("az://acct/container/path/to/slide.czi",
+                                                    opts,
+                                                    &ref,
+                                                    NULL),
+              "URI-like Azure PATH should resolve via Azure provider");
+
+  const struct azure_object_ref_data *data = ref->provider_data;
+  assert_true(data->settings->connection_timeout_ms == 5555,
+              "Azure PATH source should preserve connection timeout");
+  assert_true(data->settings->read_timeout_ms == 6666,
+              "Azure PATH source should preserve read timeout");
+  assert_true(data->settings->max_retries == 4,
+              "Azure PATH source should preserve retry count");
+
+  openslide_open_options_destroy(opts);
+}
+
 static void test_azure_scope_reuses_root_ref_settings(void) {
   openslide_open_options_t *opts = openslide_open_options_create();
   assert_true(opts != NULL, "open options creation should succeed");
@@ -475,8 +584,7 @@ static void test_azure_scope_reuses_root_ref_settings(void) {
   _openslide_open_scope_enter(ref);
 
   g_autoptr(_openslide_object_ref) same_ref = NULL;
-  assert_true(_openslide_object_ref_from_local_path("az://acct/container/path/to/slide.czi",
-                                                    &same_ref,
+  assert_true(_openslide_object_ref_from_local_path("az://acct/container/path/to/slide.czi", NULL, &same_ref,
                                                     NULL),
               "path conversion should reuse the in-scope Azure root ref");
 
@@ -517,14 +625,20 @@ int main(int argc, char **argv) {
   test_gcs_uri_parsing_and_child_resolution();
   test_azure_uri_parsing_and_child_resolution();
   test_public_source_api(&fx);
+#if defined(HAVE_S3_PROVIDER) || defined(HAVE_GCS_PROVIDER) || defined(HAVE_AZURE_PROVIDER)
+  test_cloud_retry_and_redirect_policies();
+#endif
 #ifdef HAVE_S3_PROVIDER
+  test_s3_uri_like_path_applies_options();
   test_s3_scope_reuses_root_ref_settings();
   test_s3_request_path_generation();
 #endif
 #ifdef HAVE_GCS_PROVIDER
+  test_gcs_uri_like_path_applies_options();
   test_gcs_scope_reuses_root_ref_settings();
 #endif
 #ifdef HAVE_AZURE_PROVIDER
+  test_azure_uri_like_path_applies_options();
   test_azure_scope_reuses_root_ref_settings();
 #endif
   teardown_fixture(&fx);

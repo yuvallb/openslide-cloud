@@ -53,6 +53,10 @@ bool cloud_is_retryable_http(long status) {
   return status == 408 || status == 429 || (status >= 500 && status <= 599);
 }
 
+bool cloud_should_follow_redirect(bool has_auth_headers) {
+  return !has_auth_headers;
+}
+
 void cloud_init_curl_once(void) {
   static gsize curl_initialized = 0;
   if (g_once_init_enter(&curl_initialized)) {

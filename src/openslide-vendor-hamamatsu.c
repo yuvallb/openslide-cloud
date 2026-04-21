@@ -1730,7 +1730,7 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
                                    struct _openslide_hash *quickhash1,
                                    GError **err) {
   g_autoptr(_openslide_object_ref) key_ref = NULL;
-  if (!_openslide_object_ref_from_local_path(filename, &key_ref, err)) {
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &key_ref, err)) {
     return false;
   }
 
@@ -2128,7 +2128,7 @@ static bool hamamatsu_ndpi_open(openslide_t *osr, const char *filename,
   bool restart_marker_scan = false;
 
   // open file
-  if (!_openslide_object_ref_from_local_path(filename, &root_ref, err)) {
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &root_ref, err)) {
     return false;
   }
   g_autoptr(_openslide_file) f = _openslide_fopen_ref(root_ref, err);

@@ -32,6 +32,17 @@ static struct _openslide_storage_provider s3_provider = {
   .ops = &s3_provider_ops,
 };
 
+static void secure_zero_free(char *secret) {
+  if (!secret) {
+    return;
+  }
+  volatile char *p = secret;
+  while (*p != '\0') {
+    *p++ = '\0';
+  }
+  g_free(secret);
+}
+
 static char *s3_cache_key(const char *bucket, const char *key) {
   return g_strdup_printf("%s/%s", bucket, key);
 }
@@ -80,8 +91,8 @@ static void s3_settings_unref(struct s3_settings *settings) {
   g_free(settings->region);
   g_free(settings->endpoint);
   g_free(settings->access_key_id);
-  g_free(settings->secret_access_key);
-  g_free(settings->session_token);
+  secure_zero_free(settings->secret_access_key);
+  secure_zero_free(settings->session_token);
   g_free(settings);
 }
 
@@ -515,7 +526,9 @@ static bool s3_do_request(const struct s3_settings *settings,
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    bool has_auth_headers = s3_should_sign(settings);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,
+             cloud_should_follow_redirect(has_auth_headers) ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long) settings->connection_timeout_ms);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long) settings->read_timeout_ms);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cloud_grow_write_cb);

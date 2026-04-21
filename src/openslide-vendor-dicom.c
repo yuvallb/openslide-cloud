@@ -405,7 +405,7 @@ static struct dicom_file *dicom_file_new_ref(const struct _openslide_object_ref 
 static struct dicom_file *dicom_file_new(const char *filename,
                                          bool load_metadata, GError **err) {
   g_autoptr(_openslide_object_ref) ref = NULL;
-  if (!_openslide_object_ref_from_local_path(filename, &ref, err)) {
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &ref, err)) {
     return NULL;
   }
   return dicom_file_new_ref(ref, load_metadata, err);
@@ -1089,7 +1089,7 @@ static bool dicom_open(openslide_t *osr,
                        struct _openslide_hash *quickhash1,
                        GError **err) {
   g_autoptr(_openslide_object_ref) start_ref = NULL;
-  if (!_openslide_object_ref_from_local_path(filename, &start_ref, err)) {
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &start_ref, err)) {
     return false;
   }
 

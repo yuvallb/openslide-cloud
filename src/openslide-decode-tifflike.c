@@ -616,7 +616,7 @@ struct _openslide_tifflike *_openslide_tifflike_create(const char *filename,
 
   // Phase 3: Create provider-backed object reference
   g_autoptr(GError) ref_err = NULL;
-  if (!_openslide_object_ref_from_local_path(filename, &tl->ref, &ref_err)) {
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &tl->ref, &ref_err)) {
     // It's ok if we can't create an object_ref - we'll fall back to path-based
     // This allows gradual migration
     g_debug("Couldn't create object_ref for TIFF file: %s", ref_err ? ref_err->message : "unknown");

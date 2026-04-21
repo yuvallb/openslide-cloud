@@ -266,6 +266,7 @@ struct cloud_grow_ctx {
 size_t cloud_grow_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata);
 bool cloud_is_retryable_curl(CURLcode code);
 bool cloud_is_retryable_http(long status);
+bool cloud_should_follow_redirect(bool has_auth_headers);
 void cloud_init_curl_once(void);
 bool cloud_headers_append(struct curl_slist **headers,
                           const char *header,

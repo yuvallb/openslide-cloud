@@ -57,7 +57,7 @@ struct _openslide_file *_openslide_fopen_ref(const struct _openslide_object_ref 
 
 struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
   g_autoptr(_openslide_object_ref) ref = NULL;
-  if (!_openslide_object_ref_from_local_path(path, &ref, err)) {
+  if (!_openslide_object_ref_from_local_path(path, NULL, &ref, err)) {
     g_prefix_error(err, "Couldn't open %s: ", path);
     return NULL;
   }
@@ -145,7 +145,7 @@ void _openslide_fclose(struct _openslide_file *file) {
 
 bool _openslide_fexists(const char *path, GError **err) {
   g_autoptr(_openslide_object_ref) ref = NULL;
-  if (!_openslide_object_ref_from_local_path(path, &ref, err)) {
+  if (!_openslide_object_ref_from_local_path(path, NULL, &ref, err)) {
     return false;
   }
   return _openslide_fexists_ref(ref, err);
@@ -158,7 +158,7 @@ bool _openslide_fexists_ref(const struct _openslide_object_ref *ref,
 
 struct _openslide_dir *_openslide_dir_open(const char *dirname, GError **err) {
   g_autoptr(_openslide_object_ref) ref = NULL;
-  if (!_openslide_object_ref_from_local_path(dirname, &ref, err)) {
+  if (!_openslide_object_ref_from_local_path(dirname, NULL, &ref, err)) {
     return NULL;
   }
 

@@ -241,6 +241,7 @@ struct _openslide_list_entry {
 struct _openslide_storage_provider *_openslide_get_local_provider(void);
 
 bool _openslide_object_ref_from_local_path(const char *path,
+                                           const struct _openslide_open_options *opts,
                                            struct _openslide_object_ref **out,
                                            GError **err);
 void _openslide_open_scope_enter(const struct _openslide_object_ref *ref);

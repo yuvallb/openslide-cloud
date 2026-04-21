@@ -77,7 +77,7 @@ bool _openslide_object_ref_from_uri(const char *uri,
     if (path[0] == '/' && path[1] == '/') {
       path++;
     }
-    return _openslide_object_ref_from_local_path(path, out, err);
+    return _openslide_object_ref_from_local_path(path, opts, out, err);
   }
 
 #ifdef HAVE_S3_PROVIDER
@@ -131,6 +131,7 @@ bool _openslide_object_ref_from_uri(const char *uri,
 }
 
 bool _openslide_object_ref_from_local_path(const char *path,
+                                           const struct _openslide_open_options *opts,
                                            struct _openslide_object_ref **out,
                                            GError **err) {
   const struct _openslide_object_ref *current_ref =
@@ -144,7 +145,7 @@ bool _openslide_object_ref_from_local_path(const char *path,
       g_str_has_prefix(path, "s3://") ||
       g_str_has_prefix(path, "gs://") ||
       g_str_has_prefix(path, "az://")) {
-    return _openslide_object_ref_from_uri(path, NULL, out, err);
+    return _openslide_object_ref_from_uri(path, opts, out, err);
   }
 
   return _openslide_get_local_provider()->ops->from_local_path(_openslide_get_local_provider(),
