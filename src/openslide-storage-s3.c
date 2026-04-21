@@ -851,6 +851,18 @@ static bool s3_readable_read_at(struct _openslide_readable *obj,
   g_mutex_unlock(&settings->range_cache_mutex);
 
   if (leader) {
+    if (len > (size_t) G_MAXINT64) {
+      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                  "Requested read too large");
+      return false;
+    }
+
+    if (offset > G_MAXINT64 - ((int64_t) len - 1)) {
+      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                  "Requested read range overflows");
+      return false;
+    }
+
     int64_t end = offset + (int64_t) len - 1;
     g_autofree char *range =
       g_strdup_printf("Range: bytes=%" PRId64 "-%" PRId64, offset, end);

@@ -77,7 +77,14 @@ bool _openslide_object_ref_from_uri(const char *uri,
     if (path[0] == '/' && path[1] == '/') {
       path++;
     }
-    return _openslide_object_ref_from_local_path(path, opts, out, err);
+
+    g_autofree char *decoded_path = g_uri_unescape_string(path, NULL);
+    if (!decoded_path) {
+      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                  "Invalid file URI path");
+      return false;
+    }
+    return _openslide_object_ref_from_local_path(decoded_path, opts, out, err);
   }
 
 #ifdef HAVE_S3_PROVIDER

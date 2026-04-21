@@ -412,24 +412,36 @@ static bool get_associated_image_data(struct _openslide_associated_image *_img,
       return false;
     }
 
+    size_t buf_len = img->base.w * img->base.h * 4;
     uint8_t *buf = _openslide_readable_read_into_buffer(readable, img->offset,
-                                                        img->base.w * img->base.h * 4,  // Estimate
+                                                        buf_len,
                                                         err);
     if (!buf) {
+      if (err && *err) {
+        g_clear_error(err);
+      }
+
       // Try to get actual size and read
       int64_t file_size;
       if (!_openslide_readable_get_size(readable, &file_size, err)) {
         return false;
       }
+      if (file_size < img->offset) {
+        g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                    "Invalid associated image offset");
+        return false;
+      }
+
       size_t to_read = MIN(file_size - img->offset, 1024*1024);  // Limit to 1MB
       buf = _openslide_readable_read_into_buffer(readable, img->offset,
                                                  to_read, err);
       if (!buf) {
         return false;
       }
+      buf_len = to_read;
     }
 
-    bool result = _openslide_jpeg_decode_buffer(buf, 1024*1024,  // Use actual size
+    bool result = _openslide_jpeg_decode_buffer(buf, buf_len,
                                                 dest, img->base.w, img->base.h, err);
     g_free(buf);
     return result;
