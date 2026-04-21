@@ -209,4 +209,7 @@ void _openslide_dicom_io_suspend(struct _openslide_dicom_io *dio) {
   if (dio->file) {
     _openslide_fclose(g_steal_pointer(&dio->file));
   }
+  if (dio->readable) {
+    _openslide_readable_close(g_steal_pointer(&dio->readable));
+  }
 }
