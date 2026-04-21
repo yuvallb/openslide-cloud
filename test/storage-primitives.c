@@ -46,9 +46,9 @@ static void assert_true(bool cond, const char *msg) {
   }
 }
 
-static void assert_error_contains(const GError *err,
-                                  const char *needle,
-                                  const char *msg) {
+static void G_GNUC_UNUSED assert_error_contains(const GError *err,
+                                                const char *needle,
+                                                const char *msg) {
   assert_true(err != NULL, msg);
   assert_true(strstr(err->message, needle) != NULL, msg);
 }
