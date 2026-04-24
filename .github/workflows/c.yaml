@@ -158,6 +158,9 @@ jobs:
             os: ubuntu-22.04
           - name: Ubuntu 24.04
             os: ubuntu-24.04
+          - name: Ubuntu 26.04
+            os: ubuntu-latest
+            container: ubuntu:26.04
           - name: macOS
             os: macos-latest
             sanitize: true
@@ -272,7 +275,9 @@ jobs:
       uses: actions/checkout@v6
     - name: Build
       run: |
-        args="-Dtest=enabled"
+        # disable werror for libdicom 1.2.0
+        # https://github.com/ImagingDataCommons/libdicom/pull/100
+        args="-Dtest=enabled -Dlibdicom:werror=false"
         if [ -n "${{ matrix.arch }}" ]; then
             cat > cross.ini << EOF
         [built-in options]
