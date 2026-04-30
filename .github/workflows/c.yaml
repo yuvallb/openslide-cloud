@@ -275,9 +275,7 @@ jobs:
       uses: actions/checkout@v6
     - name: Build
       run: |
-        # disable werror for libdicom 1.2.0
-        # https://github.com/ImagingDataCommons/libdicom/pull/100
-        args="-Dtest=enabled -Dlibdicom:werror=false"
+        args="-Dtest=enabled"
         if [ -n "${{ matrix.arch }}" ]; then
             cat > cross.ini << EOF
         [built-in options]
