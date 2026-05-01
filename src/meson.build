@@ -55,6 +55,12 @@ openslide_sources = files(
   'openslide-decode-xml.c',
   'openslide-error.c',
   'openslide-file.c',
+  'openslide-storage-cloud.c',
+  'openslide-storage-local.c',
+  'openslide-storage-s3.c',
+  'openslide-storage-gcs.c',
+  'openslide-storage-azure.c',
+  'openslide-storage.c',
   'openslide-grid.c',
   'openslide-hash.c',
   'openslide-jdatasrc.c',
@@ -101,7 +107,10 @@ libopenslide = library(
     zlib_dep,
     zstd_dep,
     libm_dep,
-  ],
+  ]
+    + (s3_dep.found() ? [s3_dep] : [])
+    + (gcs_dep.found() ? [gcs_dep] : [])
+    + (azure_dep.found() ? [azure_dep] : []),
   install : true,
 )
 openslide_dep = declare_dependency(

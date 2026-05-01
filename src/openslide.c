@@ -201,14 +201,150 @@ static const char **strv_from_hashtable_keys(GHashTable *h) {
   return result;
 }
 
+static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref *ref,
+                                             const openslide_open_options_t *opts G_GNUC_UNUSED);
+
 openslide_t *openslide_open(const char *filename) {
   g_assert(openslide_was_dynamically_loaded);
+
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  GError *tmp_err = NULL;
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &ref, &tmp_err)) {
+    g_clear_error(&tmp_err);
+    return NULL;
+  }
+
+  return _openslide_open_with_ref(ref, NULL);
+}
+
+// Internal helper to parse URIs and create object references
+bool _openslide_parse_uri(const char *uri,
+                          struct _openslide_object_ref **out,
+                          GError **err) {
+  return _openslide_object_ref_from_uri(uri, NULL, out, err);
+}
+
+// Create an open options object with defaults
+openslide_open_options_t *openslide_open_options_create(void) {
+  g_assert(openslide_was_dynamically_loaded);
+
+  openslide_open_options_t *opts = g_new0(openslide_open_options_t, 1);
+  opts->connection_timeout_ms = 10000;    // 10 seconds
+  opts->read_timeout_ms = 30000;          // 30 seconds
+  opts->max_retries = 3;
+  opts->max_parallel_requests = 4;
+  opts->storage_cache_bytes = 64 * 1024 * 1024;  // 64 MiB
+  opts->decoded_tile_cache_bytes = DEFAULT_CACHE_SIZE;
+  return opts;
+}
+
+void openslide_open_options_set_connection_timeout(openslide_open_options_t *opts,
+                                                   uint32_t timeout_ms) {
+  if (opts) {
+    opts->connection_timeout_ms = timeout_ms;
+  }
+}
+
+void openslide_open_options_set_read_timeout(openslide_open_options_t *opts,
+                                             uint32_t timeout_ms) {
+  if (opts) {
+    opts->read_timeout_ms = timeout_ms;
+  }
+}
+
+void openslide_open_options_set_max_retries(openslide_open_options_t *opts,
+                                            uint32_t max_retries) {
+  if (opts) {
+    opts->max_retries = max_retries;
+  }
+}
+
+void openslide_open_options_set_max_parallel_requests(openslide_open_options_t *opts,
+                                                      uint32_t max_parallel) {
+  if (opts) {
+    opts->max_parallel_requests = max_parallel;
+  }
+}
+
+void openslide_open_options_set_storage_cache_size(openslide_open_options_t *opts,
+                                                   uint64_t cache_bytes) {
+  if (opts) {
+    opts->storage_cache_bytes = cache_bytes;
+  }
+}
+
+void openslide_open_options_destroy(openslide_open_options_t *opts) {
+  g_free(opts);
+}
+
+// Create a source from a local path
+openslide_source_t *openslide_source_create_path(const char *path) {
+  g_assert(openslide_was_dynamically_loaded);
+
+  if (!path || !path[0]) {
+    return NULL;
+  }
+
+  openslide_source_t *source = g_new0(openslide_source_t, 1);
+  source->kind = _OPENSLIDE_SOURCE_KIND_PATH;
+  source->value = g_strdup(path);
+  return source;
+}
+
+// Create a source from a URI
+openslide_source_t *openslide_source_create_uri(const char *uri) {
+  g_assert(openslide_was_dynamically_loaded);
+
+  if (!uri || !uri[0]) {
+    return NULL;
+  }
+
+  GError *tmp_err = NULL;
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  if (!_openslide_parse_uri(uri, &ref, &tmp_err)) {
+    g_clear_error(&tmp_err);
+    return NULL;
+  }
+
+  openslide_source_t *source = g_new0(openslide_source_t, 1);
+  source->kind = _OPENSLIDE_SOURCE_KIND_URI;
+  source->value = g_strdup(uri);
+  return source;
+}
+
+// Destroy a source
+void openslide_source_destroy(openslide_source_t *source) {
+  if (source) {
+    g_free(source->value);
+    g_free(source);
+  }
+}
+
+// Internal helper to get filename from an object reference
+// (for backward compatibility with existing backends)
+static const char *_openslide_object_ref_to_filename(const struct _openslide_object_ref *ref) {
+  // For now, only local provider is fully integrated
+  // Future providers will need a different approach
+  return _openslide_object_ref_get_debug_name(ref);
+}
+
+// Internal helper to open with a prepared object reference
+static openslide_t *_openslide_open_with_ref(const struct _openslide_object_ref *ref,
+                                             const openslide_open_options_t *opts G_GNUC_UNUSED) {
+  g_assert(openslide_was_dynamically_loaded);
+
+  _openslide_open_scope_enter(ref);
+
+  // Get the filename for format detection and backend open
+  // This works for local files; remote providers will need special handling
+  const char *filename = _openslide_object_ref_to_filename(ref);
 
   // detect format
   g_autoptr(_openslide_tifflike) tl = NULL;
   const struct _openslide_format *format = detect_format(filename, &tl);
   if (!format) {
     // not a slide file
+    _openslide_open_scope_leave();
     return NULL;
   }
 
@@ -228,6 +364,7 @@ openslide_t *openslide_open(const char *filename) {
     g_set_error(&tmp_err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "pixman 0.38.x does not render correctly; upgrade or downgrade pixman");
     _openslide_propagate_error(osr, tmp_err);
+    _openslide_open_scope_leave();
     return g_steal_pointer(&osr);
   }
 
@@ -237,6 +374,7 @@ openslide_t *openslide_open(const char *filename) {
   if (!open_backend(osr, format, filename, tl, quickhash1, &tmp_err)) {
     // failed to read slide
     _openslide_propagate_error(osr, tmp_err);
+    _openslide_open_scope_leave();
     return g_steal_pointer(&osr);
   }
   g_assert(osr->levels);
@@ -248,6 +386,7 @@ openslide_t *openslide_open(const char *filename) {
   if (osr->level_count && osr->levels[0]->downsample == 0) {
     osr->levels[0]->downsample = 1.0;
   }
+
   for (int32_t i = 1; i < osr->level_count; i++) {
     struct _openslide_level *l = osr->levels[i];
     if (l->downsample == 0) {
@@ -259,11 +398,10 @@ openslide_t *openslide_open(const char *filename) {
 
   // check downsamples
   for (int32_t i = 1; i < osr->level_count; i++) {
-    //g_debug("downsample: %g", osr->levels[i]->downsample);
-
     if (osr->levels[i]->downsample < osr->levels[i - 1]->downsample) {
       g_warning("Downsampled images not correctly ordered: %g < %g",
-		osr->levels[i]->downsample, osr->levels[i - 1]->downsample);
+                osr->levels[i]->downsample, osr->levels[i - 1]->downsample);
+      _openslide_open_scope_leave();
       return NULL;
     }
   }
@@ -286,21 +424,21 @@ openslide_t *openslide_open(const char *filename) {
                         g_strdup_printf("%"PRId64, osr->icc_profile_size));
   }
   g_hash_table_insert(osr->properties,
-		      g_strdup(_OPENSLIDE_PROPERTY_NAME_LEVEL_COUNT),
-		      g_strdup_printf("%d", osr->level_count));
-  bool should_have_geometry = false;  // initialize for gcc 4.4
+                      g_strdup(_OPENSLIDE_PROPERTY_NAME_LEVEL_COUNT),
+                      g_strdup_printf("%d", osr->level_count));
+  bool should_have_geometry = false;
   for (int32_t i = 0; i < osr->level_count; i++) {
     struct _openslide_level *l = osr->levels[i];
 
     g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_WIDTH, i),
-			g_strdup_printf("%"PRId64, l->w));
+                        g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_WIDTH, i),
+                        g_strdup_printf("%"PRId64, l->w));
     g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_HEIGHT, i),
-			g_strdup_printf("%"PRId64, l->h));
+                        g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_HEIGHT, i),
+                        g_strdup_printf("%"PRId64, l->h));
     g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_DOWNSAMPLE, i),
-			_openslide_format_double(l->downsample));
+                        g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_LEVEL_DOWNSAMPLE, i),
+                        _openslide_format_double(l->downsample));
 
     // tile geometry
     bool have_geometry = (l->tile_w > 0 && l->tile_h > 0);
@@ -326,11 +464,11 @@ openslide_t *openslide_open(const char *filename) {
     struct _openslide_associated_image *img =
       g_hash_table_lookup(osr->associated_images, *name);
     g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_ASSOCIATED_WIDTH, *name),
-			g_strdup_printf("%"PRId64, img->w));
+                        g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_ASSOCIATED_WIDTH, *name),
+                        g_strdup_printf("%"PRId64, img->w));
     g_hash_table_insert(osr->properties,
-			g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_ASSOCIATED_HEIGHT, *name),
-			g_strdup_printf("%"PRId64, img->h));
+                        g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_ASSOCIATED_HEIGHT, *name),
+                        g_strdup_printf("%"PRId64, img->h));
     if (img->icc_profile_size) {
       g_hash_table_insert(osr->properties,
                           g_strdup_printf(_OPENSLIDE_PROPERTY_NAME_TEMPLATE_ASSOCIATED_ICC_SIZE, *name),
@@ -355,10 +493,90 @@ openslide_t *openslide_open(const char *filename) {
 
   // start cache if the backend hasn't already done it
   if (!osr->cache) {
-    osr->cache = _openslide_cache_binding_create(DEFAULT_CACHE_SIZE);
+    uint64_t cache_size = DEFAULT_CACHE_SIZE;
+    if (opts && opts->decoded_tile_cache_bytes > 0) {
+      cache_size = opts->decoded_tile_cache_bytes;
+    }
+    osr->cache = _openslide_cache_binding_create(cache_size);
   }
 
+  _openslide_open_scope_leave();
   return g_steal_pointer(&osr);
+}
+
+// Public API: open from URI
+openslide_t *openslide_open_uri(const char *uri) {
+  g_assert(openslide_was_dynamically_loaded);
+
+  if (!uri || !uri[0]) {
+    return NULL;
+  }
+
+  openslide_open_options_t default_opts = {
+    .connection_timeout_ms = 10000,
+    .read_timeout_ms = 30000,
+    .max_retries = 3,
+    .max_parallel_requests = 4,
+    .storage_cache_bytes = 64 * 1024 * 1024,
+    .decoded_tile_cache_bytes = DEFAULT_CACHE_SIZE,
+  };
+
+  GError *tmp_err = NULL;
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  if (!_openslide_object_ref_from_uri(uri, &default_opts, &ref, &tmp_err)) {
+    g_clear_error(&tmp_err);
+    return NULL;
+  }
+
+  return _openslide_open_with_ref(ref, NULL);
+}
+
+// Public API: open with options
+openslide_t *openslide_open_with_options(const openslide_source_t *source,
+                                         const openslide_open_options_t *opts) {
+  g_assert(openslide_was_dynamically_loaded);
+
+  if (!source || !source->value || !source->value[0]) {
+    return NULL;
+  }
+
+  openslide_open_options_t default_opts = {
+    .connection_timeout_ms = 10000,
+    .read_timeout_ms = 30000,
+    .max_retries = 3,
+    .max_parallel_requests = 4,
+    .storage_cache_bytes = 64 * 1024 * 1024,
+    .decoded_tile_cache_bytes = DEFAULT_CACHE_SIZE,
+  };
+  const openslide_open_options_t *effective_opts = opts ? opts : &default_opts;
+
+  g_autoptr(_openslide_object_ref) ref = NULL;
+  GError *tmp_err = NULL;
+  bool ok = false;
+
+  switch (source->kind) {
+  case _OPENSLIDE_SOURCE_KIND_PATH:
+    ok = _openslide_object_ref_from_local_path(source->value,
+                           effective_opts,
+                           &ref,
+                           &tmp_err);
+    break;
+  case _OPENSLIDE_SOURCE_KIND_URI:
+    ok = _openslide_object_ref_from_uri(source->value, effective_opts, &ref, &tmp_err);
+    break;
+  default:
+    ok = false;
+    g_set_error(&tmp_err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                "Invalid source type");
+    break;
+  }
+
+  if (!ok) {
+    g_clear_error(&tmp_err);
+    return NULL;
+  }
+
+  return _openslide_open_with_ref(ref, effective_opts);
 }
 
 

@@ -94,6 +94,7 @@ static const int KEY_FILE_MAX_SIZE = 64 << 10;
 
 struct jpeg {
   char *filename;
+  struct _openslide_object_ref *ref;
   int64_t start_in_file;
   int64_t end_in_file;
 
@@ -156,6 +157,7 @@ struct ngr_level {
   struct _openslide_grid *grid;
 
   char *filename;
+  struct _openslide_object_ref *ref;
 
   int64_t start_in_file;
 
@@ -284,6 +286,7 @@ OPENSLIDE_DEFINE_G_DESTROY_NOTIFY_WRAPPER(jpeg_level_free)
 
 static void jpeg_free(struct jpeg *jpeg) {
   g_free(jpeg->filename);
+  _openslide_object_ref_unref(jpeg->ref);
   g_free(jpeg->mcu_starts);
   g_free(jpeg->unreliable_mcu_starts);
   g_free(jpeg);
@@ -596,7 +599,7 @@ static bool read_from_jpeg(openslide_t *osr,
                            int32_t w, int32_t h,
                            GError **err) {
   // open file
-  g_autoptr(_openslide_file) f = _openslide_fopen(jpeg->filename, err);
+  g_autoptr(_openslide_file) f = _openslide_fopen_ref(jpeg->ref, err);
   if (f == NULL) {
     return false;
   }
@@ -873,8 +876,8 @@ static bool verify_mcu_starts(int32_t num_jpegs, struct jpeg **jpegs,
   for (int32_t current_jpeg = 0; current_jpeg < num_jpegs; current_jpeg++) {
     struct jpeg *jp = jpegs[current_jpeg];
     int32_t current_mcu_start = 0;
-    CHK(jp->filename);
-    g_autoptr(_openslide_file) f = _openslide_fopen(jp->filename, NULL);
+    CHK(jp->ref);
+    g_autoptr(_openslide_file) f = _openslide_fopen_ref(jp->ref, NULL);
     CHK(f);
     for (current_mcu_start = 1; current_mcu_start < jp->tile_count;
          current_mcu_start++) {
@@ -943,7 +946,7 @@ static gpointer restart_marker_thread_func(gpointer d) {
     struct jpeg *jp = data->all_jpegs[current_jpeg];
     if (jp->tile_count > 1) {
       if (current_file == NULL) {
-	current_file = _openslide_fopen(jp->filename, &tmp_err);
+        current_file = _openslide_fopen_ref(jp->ref, &tmp_err);
 	if (current_file == NULL) {
 	  //g_debug("restart_marker_thread_func fopen failed");
 	  break;
@@ -1380,7 +1383,7 @@ static struct jpeg_level *create_jpeg_level(openslide_t *osr,
 }
 
 static bool hamamatsu_vms_part2(openslide_t *osr,
-				int num_jpegs, char **image_filenames,
+                                int num_jpegs, struct _openslide_object_ref **image_refs,
 				int num_jpeg_cols, int num_jpeg_rows,
 				struct _openslide_file *optimisation_file,
 				GError **err) {
@@ -1391,9 +1394,10 @@ static bool hamamatsu_vms_part2(openslide_t *osr,
     struct jpeg *jp = g_new0(struct jpeg, 1);
     g_ptr_array_add(setup->jpegs, jp);
 
-    jp->filename = g_strdup(image_filenames[i]);
+    jp->ref = _openslide_object_ref_ref(image_refs[i]);
+    jp->filename = g_strdup(_openslide_object_ref_get_debug_name(jp->ref));
 
-    g_autoptr(_openslide_file) f = _openslide_fopen(jp->filename, err);
+    g_autoptr(_openslide_file) f = _openslide_fopen_ref(jp->ref, err);
     if (f == NULL) {
       g_prefix_error(err, "Can't open JPEG %d: ", i);
       return false;
@@ -1520,6 +1524,7 @@ static bool hamamatsu_vms_part2(openslide_t *osr,
 
 static void ngr_level_free(struct ngr_level *l) {
   g_free(l->filename);
+  _openslide_object_ref_unref(l->ref);
   _openslide_grid_destroy(l->grid);
   g_free(l);
 }
@@ -1550,7 +1555,7 @@ static bool ngr_read_tile(openslide_t *osr,
 
   if (!tiledata) {
     // read the tile data
-    g_autoptr(_openslide_file) f = _openslide_fopen(l->filename, err);
+    g_autoptr(_openslide_file) f = _openslide_fopen_ref(l->ref, err);
     if (!f) {
       return false;
     }
@@ -1634,7 +1639,7 @@ static int32_t read_le_int32_from_file(struct _openslide_file *f) {
 }
 
 static bool hamamatsu_vmu_part2(openslide_t *osr,
-				int num_levels, char **image_filenames,
+                                int num_levels, struct _openslide_object_ref **image_refs,
 				GError **err) {
   // initialize individual ngr structs
   g_autoptr(GPtrArray) level_array =
@@ -1645,9 +1650,10 @@ static bool hamamatsu_vmu_part2(openslide_t *osr,
     struct ngr_level *l = g_new0(struct ngr_level, 1);
     g_ptr_array_add(level_array, l);
 
-    l->filename = g_strdup(image_filenames[i]);
+    l->ref = _openslide_object_ref_ref(image_refs[i]);
+    l->filename = g_strdup(_openslide_object_ref_get_debug_name(l->ref));
 
-    g_autoptr(_openslide_file) f = _openslide_fopen(l->filename, err);
+    g_autoptr(_openslide_file) f = _openslide_fopen_ref(l->ref, err);
     if (f == NULL) {
       return false;
     }
@@ -1723,6 +1729,11 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
                                    struct _openslide_tifflike *tl G_GNUC_UNUSED,
                                    struct _openslide_hash *quickhash1,
                                    GError **err) {
+  g_autoptr(_openslide_object_ref) key_ref = NULL;
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &key_ref, err)) {
+    return false;
+  }
+
   // first, see if it's a VMS/VMU file
   g_autoptr(GKeyFile) key_file =
     _openslide_read_key_file(filename, KEY_FILE_MAX_SIZE,
@@ -1771,9 +1782,10 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
                 "Too many columns or rows");
     return false;
   }
-  g_autoptr(GPtrArray) image_filenames =
-    g_ptr_array_new_full(num_images_tmp, g_free);
-  g_ptr_array_set_size(image_filenames, num_images_tmp);
+  g_autoptr(GPtrArray) image_refs =
+    g_ptr_array_new_full(num_images_tmp,
+                         (GDestroyNotify) _openslide_object_ref_unref);
+  g_ptr_array_set_size(image_refs, num_images_tmp);
 
   // hash in the key file
   if (!_openslide_hash_file(quickhash1, filename, err)) {
@@ -1781,16 +1793,18 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
   }
 
   // extract MapFile
-  g_autofree char *dirname = g_path_get_dirname(filename);
   g_autofree char *map = g_key_file_get_string(key_file, groupname,
                                                KEY_MAP_FILE, NULL);
   if (map && *map) {
-    char *map_filename = g_build_filename(dirname, map, NULL);
-
-    image_filenames->pdata[image_filenames->len - 1] = map_filename;
+    struct _openslide_object_ref *map_ref = NULL;
+    if (!_openslide_object_ref_resolve_child(key_ref, map, &map_ref, err)) {
+      return false;
+    }
+    image_refs->pdata[image_refs->len - 1] = map_ref;
 
     // hash in the map file
-    if (!_openslide_hash_file(quickhash1, map_filename, err)) {
+    g_autoptr(_openslide_readable) map_readable = _openslide_readable_open(map_ref, err);
+    if (!map_readable || !_openslide_hash_readable(quickhash1, map_readable, err)) {
       return false;
     }
   } else {
@@ -1899,18 +1913,22 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
       int i = row * num_cols + col;
 
       // init the file
-      if (image_filenames->pdata[i]) {
+      if (image_refs->pdata[i]) {
         g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                     "Duplicate image for (%d,%d)", col, row);
         return false;
       }
-      image_filenames->pdata[i] = g_build_filename(dirname, value, NULL);
+      struct _openslide_object_ref *child_ref = NULL;
+      if (!_openslide_object_ref_resolve_child(key_ref, value, &child_ref, err)) {
+        return false;
+      }
+      image_refs->pdata[i] = child_ref;
     }
   }
 
   // ensure all image filenames are filled
-  for (guint i = 0; i < image_filenames->len; i++) {
-    if (!image_filenames->pdata[i]) {
+  for (guint i = 0; i < image_refs->len; i++) {
+    if (!image_refs->pdata[i]) {
       g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                   "Can't read image filename %d", i);
       return false;
@@ -1921,8 +1939,12 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
   g_autofree char *macro = g_key_file_get_string(key_file, groupname,
                                                  KEY_MACRO_IMAGE, NULL);
   if (macro && *macro) {
-    g_autofree char *macro_filename = g_build_filename(dirname, macro, NULL);
-    if (!_openslide_jpeg_add_associated_image(osr, "macro", macro_filename,
+    g_autoptr(_openslide_object_ref) macro_ref = NULL;
+    if (!_openslide_object_ref_resolve_child(key_ref, macro, &macro_ref, err)) {
+      return false;
+    }
+    if (!_openslide_jpeg_add_associated_image(
+          osr, "macro", _openslide_object_ref_get_debug_name(macro_ref),
                                               0, err)) {
       return false;
     }
@@ -1935,10 +1957,11 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
     g_autofree char *opt = g_key_file_get_string(key_file, GROUP_VMS,
 				                 KEY_OPTIMISATION_FILE, NULL);
     if (opt) {
-      g_autofree char *optimisation_filename =
-        g_build_filename(dirname, opt, NULL);
-
-      optimisation_file = _openslide_fopen(optimisation_filename, NULL);
+      g_autoptr(_openslide_object_ref) optimisation_ref = NULL;
+      if (_openslide_object_ref_resolve_child(key_ref, opt,
+                                              &optimisation_ref, NULL)) {
+        optimisation_file = _openslide_fopen_ref(optimisation_ref, NULL);
+      }
 
       if (optimisation_file == NULL) {
 	// g_debug("Can't open optimisation file");
@@ -1952,8 +1975,8 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
 
     // do all the jpeg stuff
     if (!hamamatsu_vms_part2(osr,
-                             image_filenames->len,
-                             (char **) image_filenames->pdata,
+                             image_refs->len,
+                             (struct _openslide_object_ref **) image_refs->pdata,
                              num_cols, num_rows,
                              optimisation_file,
                              err)) {
@@ -1977,8 +2000,8 @@ static bool hamamatsu_vms_vmu_open(openslide_t *osr, const char *filename,
     } else {
       // assumptions verified
       if (!hamamatsu_vmu_part2(osr,
-                               image_filenames->len,
-                               (char **) image_filenames->pdata,
+                               image_refs->len,
+                               (struct _openslide_object_ref **) image_refs->pdata,
                                err)) {
         return false;
       }
@@ -2100,11 +2123,15 @@ static bool hamamatsu_ndpi_open(openslide_t *osr, const char *filename,
                                 struct _openslide_hash *quickhash1,
                                 GError **err) {
   g_autoptr(jpeg_setup) setup = jpeg_setup_new();
+  g_autoptr(_openslide_object_ref) root_ref = NULL;
   GError *tmp_err = NULL;
   bool restart_marker_scan = false;
 
   // open file
-  g_autoptr(_openslide_file) f = _openslide_fopen(filename, err);
+  if (!_openslide_object_ref_from_local_path(filename, NULL, &root_ref, err)) {
+    return false;
+  }
+  g_autoptr(_openslide_file) f = _openslide_fopen_ref(root_ref, err);
   if (!f) {
     return false;
   }
@@ -2208,6 +2235,7 @@ static bool hamamatsu_ndpi_open(openslide_t *osr, const char *filename,
       // init jpeg
       struct jpeg *jp = g_new0(struct jpeg, 1);
       g_ptr_array_add(setup->jpegs, jp);
+      jp->ref = _openslide_object_ref_ref(root_ref);
       jp->filename = g_strdup(filename);
       jp->start_in_file = start_in_file;
       jp->end_in_file = start_in_file + num_bytes;

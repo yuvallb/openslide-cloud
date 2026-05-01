@@ -3,6 +3,7 @@
  *
  *  Copyright (c) 2007-2014 Carnegie Mellon University
  *  All rights reserved.
+
  *
  *  OpenSlide is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU Lesser General Public License as
@@ -200,11 +201,117 @@ bool _openslide_clip_tile(uint32_t *tiledata,
 #define OPENSLIDE_DEFINE_G_DESTROY_NOTIFY_WRAPPER(f) \
   static void OPENSLIDE_G_DESTROY_NOTIFY_WRAPPER(f)(void *p) {f(p);}
 
+// Storage abstraction
+struct _openslide_storage_provider;
+struct _openslide_object_ref;
+struct _openslide_readable;
+
+// Public API source and options types
+enum _openslide_source_kind {
+  _OPENSLIDE_SOURCE_KIND_PATH,
+  _OPENSLIDE_SOURCE_KIND_URI,
+};
+
+struct _openslide_source {
+  enum _openslide_source_kind kind;
+  char *value;
+};
+
+struct _openslide_open_options {
+  uint32_t connection_timeout_ms;
+  uint32_t read_timeout_ms;
+  uint32_t max_retries;
+  uint32_t max_parallel_requests;
+  uint64_t storage_cache_bytes;
+  uint64_t decoded_tile_cache_bytes;
+};
+
+
+struct _openslide_object_stat {
+  int64_t size;
+  bool exists;
+  bool is_container;
+};
+
+struct _openslide_list_entry {
+  char *name;
+  struct _openslide_object_ref *ref;
+};
+
+struct _openslide_storage_provider *_openslide_get_local_provider(void);
+
+bool _openslide_object_ref_from_local_path(const char *path,
+                                           const struct _openslide_open_options *opts,
+                                           struct _openslide_object_ref **out,
+                                           GError **err);
+void _openslide_open_scope_enter(const struct _openslide_object_ref *ref);
+void _openslide_open_scope_leave(void);
+const struct _openslide_object_ref *_openslide_open_scope_get_current_ref(void);
+struct _openslide_object_ref *_openslide_object_ref_ref(struct _openslide_object_ref *ref);
+void _openslide_object_ref_unref(struct _openslide_object_ref *ref);
+const char *_openslide_object_ref_get_debug_name(const struct _openslide_object_ref *ref);
+
+bool _openslide_object_ref_exists(const struct _openslide_object_ref *ref,
+                                  GError **err);
+bool _openslide_object_ref_stat(const struct _openslide_object_ref *ref,
+                                struct _openslide_object_stat *out,
+                                GError **err);
+bool _openslide_object_ref_resolve_child(const struct _openslide_object_ref *base,
+                                         const char *child_name,
+                                         struct _openslide_object_ref **out,
+                                         GError **err);
+bool _openslide_object_ref_list_children(const struct _openslide_object_ref *base,
+                                         GPtrArray **out,
+                                         GError **err);
+
+void _openslide_list_entry_free(struct _openslide_list_entry *entry);
+
+struct _openslide_readable *_openslide_readable_open(const struct _openslide_object_ref *ref,
+                                                      GError **err);
+bool _openslide_readable_get_size(struct _openslide_readable *obj,
+                                  int64_t *size_out,
+                                  GError **err);
+bool _openslide_readable_read_at(struct _openslide_readable *obj,
+                                 int64_t offset,
+                                 void *buf,
+                                 size_t len,
+                                 size_t *bytes_read,
+                                 GError **err);
+void _openslide_readable_close(struct _openslide_readable *obj);
+
+// Helper: read exactly len bytes from offset, or fail
+bool _openslide_readable_read_exact(struct _openslide_readable *obj,
+                                    int64_t offset,
+                                    void *buf,
+                                    size_t len,
+                                    GError **err);
+
+// Helper: read into newly allocated buffer from readable object
+uint8_t *_openslide_readable_read_into_buffer(struct _openslide_readable *obj,
+                                              int64_t offset,
+                                              size_t len,
+                                              GError **err);
+
+typedef struct _openslide_object_ref _openslide_object_ref;
+typedef struct _openslide_readable _openslide_readable;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(_openslide_object_ref, _openslide_object_ref_unref)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(_openslide_readable, _openslide_readable_close)
+
+// URI parsing and source management
+bool _openslide_parse_uri(const char *uri,
+                          struct _openslide_object_ref **out,
+                          GError **err);
+bool _openslide_object_ref_from_uri(const char *uri,
+                                    const struct _openslide_open_options *opts,
+                                    struct _openslide_object_ref **out,
+                                    GError **err);
 
 // File handling
 struct _openslide_file;
 
 struct _openslide_file *_openslide_fopen(const char *path, GError **err);
+struct _openslide_file *_openslide_fopen_ref(const struct _openslide_object_ref *ref,
+                                             GError **err);
 size_t _openslide_fread(struct _openslide_file *file, void *buf, size_t size,
                         GError **err);
 bool _openslide_fread_exact(struct _openslide_file *file,
@@ -215,6 +322,8 @@ int64_t _openslide_ftell(struct _openslide_file *file, GError **err);
 int64_t _openslide_fsize(struct _openslide_file *file, GError **err);
 void _openslide_fclose(struct _openslide_file *file);
 bool _openslide_fexists(const char *path, GError **err);
+bool _openslide_fexists_ref(const struct _openslide_object_ref *ref,
+                            GError **err);
 
 typedef struct _openslide_file _openslide_file;
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(_openslide_file, _openslide_fclose)
@@ -365,6 +474,15 @@ bool _openslide_hash_file_part(struct _openslide_hash *hash,
 			       const char *filename,
 			       int64_t offset, int64_t size,
 			       GError **err);
+
+// Phase 3 provider-backed hash functions
+bool _openslide_hash_readable(struct _openslide_hash *hash,
+                              struct _openslide_readable *readable,
+                              GError **err);
+bool _openslide_hash_readable_part(struct _openslide_hash *hash,
+                                   struct _openslide_readable *readable,
+                                   int64_t offset, int64_t size,
+                                   GError **err);
 
 // lockout
 void _openslide_hash_disable(struct _openslide_hash *hash);

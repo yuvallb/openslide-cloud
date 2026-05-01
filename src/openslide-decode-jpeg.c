@@ -72,6 +72,8 @@ struct associated_image {
   struct _openslide_associated_image base;
   char *filename;
   int64_t offset;
+  struct _openslide_object_ref *ref;  // Phase 3: provider-backed reference
+  bool use_ref;
 };
 
 
@@ -401,7 +403,51 @@ static bool get_associated_image_data(struct _openslide_associated_image *_img,
   struct associated_image *img = (struct associated_image *) _img;
 
   //g_debug("read JPEG associated image: %s %"PRId64, img->filename, img->offset);
+  
+  // Phase 3: Use provider-backed reads if available
+  if (img->use_ref && img->ref) {
+    // Read JPEG data into buffer for decoding
+    g_autoptr(_openslide_readable) readable = _openslide_readable_open(img->ref, err);
+    if (!readable) {
+      return false;
+    }
 
+    size_t buf_len = img->base.w * img->base.h * 4;
+    uint8_t *buf = _openslide_readable_read_into_buffer(readable, img->offset,
+                                                        buf_len,
+                                                        err);
+    if (!buf) {
+      if (err && *err) {
+        g_clear_error(err);
+      }
+
+      // Try to get actual size and read
+      int64_t file_size;
+      if (!_openslide_readable_get_size(readable, &file_size, err)) {
+        return false;
+      }
+      if (file_size < img->offset) {
+        g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                    "Invalid associated image offset");
+        return false;
+      }
+
+      size_t to_read = MIN(file_size - img->offset, 1024*1024);  // Limit to 1MB
+      buf = _openslide_readable_read_into_buffer(readable, img->offset,
+                                                 to_read, err);
+      if (!buf) {
+        return false;
+      }
+      buf_len = to_read;
+    }
+
+    bool result = _openslide_jpeg_decode_buffer(buf, buf_len,
+                                                dest, img->base.w, img->base.h, err);
+    g_free(buf);
+    return result;
+  }
+
+  // Fallback to legacy path-based reading
   g_autoptr(_openslide_file) f = _openslide_fopen(img->filename, err);
   if (f == NULL) {
     return false;
@@ -414,6 +460,7 @@ static void destroy_associated_image(struct _openslide_associated_image *_img) {
   struct associated_image *img = (struct associated_image *) _img;
 
   g_free(img->filename);
+    _openslide_object_ref_unref(img->ref);  // Phase 3
   g_free(img);
 }
 
@@ -444,6 +491,17 @@ bool _openslide_jpeg_add_associated_image(openslide_t *osr,
   img->base.h = h;
   img->filename = g_strdup(filename);
   img->offset = offset;
+
+  // Phase 3: Create provider-backed reference
+  g_autoptr(GError) ref_err = NULL;
+  if (_openslide_object_ref_from_local_path(filename, NULL, &img->ref, &ref_err)) {
+    img->use_ref = true;
+  } else {
+    g_debug("Couldn't create object_ref for JPEG associated image: %s",
+            ref_err ? ref_err->message : "unknown");
+    img->ref = NULL;
+    img->use_ref = false;
+  }
 
   g_hash_table_insert(osr->associated_images, g_strdup(name), img);
 

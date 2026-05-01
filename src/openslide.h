@@ -58,6 +58,28 @@ typedef struct _openslide openslide_t;
  */
 typedef struct _openslide_cache openslide_cache_t;
 
+/**
+ * A source identifier for opening a whole slide image.
+ *
+ * An @ref openslide_source_t identifies a slide source, which can be a local
+ * file path, a URI, or a provider-backed reference. Use
+ * openslide_source_create_path() to create from a local path, or
+ * openslide_source_create_uri() to create from a URI.
+ *
+ * @since 4.1.0
+ */
+typedef struct _openslide_source openslide_source_t;
+
+/**
+ * Configuration options for opening a whole slide image.
+ *
+ * An @ref openslide_open_options_t contains optional configuration for
+ * network behavior, caching, and provider-specific settings. Use
+ * openslide_open_options_create() to create a new options object.
+ *
+ * @since 4.1.0
+ */
+typedef struct _openslide_open_options openslide_open_options_t;
 
 /**
  * @name Basic Usage
@@ -103,6 +125,194 @@ const char *openslide_detect_vendor(const char *filename);
 OPENSLIDE_PUBLIC()
 openslide_t *openslide_open(const char *filename);
 
+/**
+ * Open a whole slide image from a URI.
+ *
+ * This function is similar to openslide_open() but accepts a URI instead
+ * of a local filesystem path. Supported URI schemes include:
+ *
+ * - `file://` - Local filesystem path (e.g., `file:///path/to/slide.svs`)
+ * - `s3://` - Amazon S3 object (e.g., `s3://bucket/slides/sample.czi`)
+ * - `gs://` - Google Cloud Storage object (e.g., `gs://bucket/slides/sample.czi`)
+ * - `az://` - Azure Blob object (e.g., `az://account/container/slide.czi`)
+ *
+ * This function uses default configuration for network behavior, timeouts,
+ * and caching. For advanced control, use openslide_open_with_options().
+ *
+ * On Windows, URIs should use forward slashes and paths should be in UTF-8.
+ *
+ * @param uri The URI to open.  On Windows, this must be in UTF-8.
+ * @return
+ *         On success, a new OpenSlide object.
+ *         If the URI scheme is not recognized, NULL.
+ *         If the resource is not a recognized slide format, NULL.
+ *         If the resource is recognized but an error occurred, an OpenSlide
+ *         object in error state.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+openslide_t *openslide_open_uri(const char *uri);
+
+/**
+ * Create an openslide_source from a local filesystem path.
+ *
+ * The returned source can be passed to openslide_open_with_options() along
+ * with options to control network and cache behavior.
+ *
+ * The source must be released with openslide_source_destroy() when done.
+ *
+ * @param path The local filesystem path.
+ * @return A new source object, or NULL if path is invalid.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+openslide_source_t *openslide_source_create_path(const char *path);
+
+/**
+ * Create an openslide_source from a URI.
+ *
+ * The returned source can be passed to openslide_open_with_options() along
+ * with options to control network and cache behavior.
+ *
+ * The source must be released with openslide_source_destroy() when done.
+ *
+ * @param uri The URI (e.g., `s3://bucket/slide.czi`,
+ *            `gs://bucket/slide.czi`, `az://account/container/slide.czi`).
+ * @return A new source object, or NULL if the URI scheme is not recognized.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+openslide_source_t *openslide_source_create_uri(const char *uri);
+
+/**
+ * Release an openslide_source.
+ *
+ * @param source The source to release, or NULL.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+void openslide_source_destroy(openslide_source_t *source);
+
+/**
+ * Create default open options.
+ *
+ * The returned options object contains default values for all settings.
+ * Individual settings can be modified with functions like
+ * openslide_open_options_set_connection_timeout().
+ *
+ * The options must be released with openslide_open_options_destroy() when done.
+ *
+ * @return A new options object.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+openslide_open_options_t *openslide_open_options_create(void);
+
+/**
+ * Set the connection timeout for remote operations.
+ *
+ * This controls the maximum time to establish a connection to a remote
+ * storage provider. The default is 10000 milliseconds (10 seconds).
+ *
+ * @param opts The options object.
+ * @param timeout_ms The timeout in milliseconds, or 0 for no timeout.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+void openslide_open_options_set_connection_timeout(openslide_open_options_t *opts,
+                                                   uint32_t timeout_ms);
+
+/**
+ * Set the read timeout for remote operations.
+ *
+ * This controls the maximum time to wait for a remote read operation to
+ * complete. The default is 30000 milliseconds (30 seconds).
+ *
+ * @param opts The options object.
+ * @param timeout_ms The timeout in milliseconds, or 0 for no timeout.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+void openslide_open_options_set_read_timeout(openslide_open_options_t *opts,
+                                             uint32_t timeout_ms);
+
+/**
+ * Set the maximum number of retries for transient failures.
+ *
+ * When a remote read operation fails with a transient error, it will be
+ * retried up to this many times. The default is 3 retries.
+ *
+ * @param opts The options object.
+ * @param max_retries The maximum number of retries.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+void openslide_open_options_set_max_retries(openslide_open_options_t *opts,
+                                            uint32_t max_retries);
+
+/**
+ * Set the maximum number of parallel requests.
+ *
+ * This controls the degree of parallelism when performing remote I/O
+ * operations. The default is 4 concurrent requests.
+ *
+ * @param opts The options object.
+ * @param max_parallel The maximum number of parallel requests.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+void openslide_open_options_set_max_parallel_requests(openslide_open_options_t *opts,
+                                                      uint32_t max_parallel);
+
+/**
+ * Set the storage cache size.
+ *
+ * This configures a cache for frequently accessed metadata and byte ranges
+ * from remote storage. The default is 64 MiB (67108864 bytes).
+ *
+ * Set to 0 to disable the storage cache.
+ *
+ * @param opts The options object.
+ * @param cache_bytes The cache size in bytes.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+void openslide_open_options_set_storage_cache_size(openslide_open_options_t *opts,
+                                                   uint64_t cache_bytes);
+
+/**
+ * Release open options.
+ *
+ * @param opts The options object, or NULL.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+void openslide_open_options_destroy(openslide_open_options_t *opts);
+
+/**
+ * Open a whole slide image with explicit source and options.
+ *
+ * This function combines a source (local path or URI) with explicit
+ * configuration options to open a slide. It allows callers to control
+ * network timeouts, cache sizes, retry behavior, and other tuning parameters.
+ *
+ * This function can be expensive; avoid calling it unnecessarily.  For
+ * example, a tile server should not call openslide_open_with_options() on
+ * every tile request.  Instead, it should maintain a cache of OpenSlide
+ * objects and reuse them when possible.
+ *
+ * @param source The source to open.
+ * @param opts The configuration options, or NULL for defaults.
+ * @return
+ *         On success, a new OpenSlide object.
+ *         If the source is not a recognized slide format, NULL.
+ *         If the source is recognized but an error occurred, an OpenSlide
+ *         object in error state.
+ * @since 4.1.0
+ */
+OPENSLIDE_PUBLIC()
+openslide_t *openslide_open_with_options(const openslide_source_t *source,
+                                         const openslide_open_options_t *opts);
 
 /**
  * Get the number of levels in the whole slide image.

@@ -194,7 +194,8 @@ struct level {
 };
 
 struct mirax_ops_data {
-  gchar **datafile_paths;
+  int datafile_count;
+  struct _openslide_object_ref **datafile_refs;
 };
 
 static void image_unref(struct image *image) {
@@ -223,7 +224,7 @@ static uint32_t *read_image(openslide_t *osr,
   g_autofree uint32_t *dest = g_malloc(w * h * 4);
 
   g_autoptr(_openslide_file) f =
-    _openslide_fopen(data->datafile_paths[image->fileno], err);
+    _openslide_fopen_ref(data->datafile_refs[image->fileno], err);
   if (!f) {
     return NULL;
   }
@@ -358,7 +359,10 @@ static void destroy(openslide_t *osr) {
   g_free(osr->levels);
 
   // the ops data
-  g_strfreev(data->datafile_paths);
+  for (int i = 0; i < data->datafile_count; i++) {
+    _openslide_object_ref_unref(data->datafile_refs[i]);
+  }
+  g_free(data->datafile_refs);
   g_free(data);
 }
 
@@ -395,12 +399,19 @@ static bool mirax_detect(const char *filename, struct _openslide_tifflike *tl,
     return false;
   }
 
-  // verify slidedat exists
-  g_autofree char *dirname =
+  // verify slidedat exists via provider child resolution
+  g_autofree char *bundle_path =
     g_strndup(filename, strlen(filename) - strlen(MRXS_EXT));
-  g_autofree char *slidedat_path =
-    g_build_filename(dirname, SLIDEDAT_INI, NULL);
-  if (!_openslide_fexists(slidedat_path, &tmp_err)) {
+  g_autoptr(_openslide_object_ref) bundle_ref = NULL;
+  if (!_openslide_object_ref_from_local_path(bundle_path, NULL, &bundle_ref, err)) {
+    return false;
+  }
+  g_autoptr(_openslide_object_ref) slidedat_ref = NULL;
+  if (!_openslide_object_ref_resolve_child(bundle_ref, SLIDEDAT_INI,
+                                           &slidedat_ref, err)) {
+    return false;
+  }
+  if (!_openslide_fexists_ref(slidedat_ref, &tmp_err)) {
     if (tmp_err != NULL) {
       g_propagate_prefixed_error(err, tmp_err, "Testing whether %s exists: ",
                                  SLIDEDAT_INI);
@@ -1372,18 +1383,27 @@ static int get_associated_image_nonhier_offset(GKeyFile *keyfile,
 static bool mirax_open(openslide_t *osr, const char *filename,
                        struct _openslide_tifflike *tl G_GNUC_UNUSED,
                        struct _openslide_hash *quickhash1, GError **err) {
-  // get directory from filename
-  g_autofree char *dirname =
+  // resolve MIRAX bundle root and key files via provider child operations
+  g_autofree char *bundle_path =
     g_strndup(filename, strlen(filename) - strlen(MRXS_EXT));
-
-  // first, check slidedat
-  g_autofree char *slidedat_path =
-    g_build_filename(dirname, SLIDEDAT_INI, NULL);
-  // hash the slidedat
-  if (!_openslide_hash_file(quickhash1, slidedat_path, err)) {
+  g_autoptr(_openslide_object_ref) bundle_ref = NULL;
+  if (!_openslide_object_ref_from_local_path(bundle_path, NULL, &bundle_ref, err)) {
     return false;
   }
 
+  g_autoptr(_openslide_object_ref) slidedat_ref = NULL;
+  if (!_openslide_object_ref_resolve_child(bundle_ref, SLIDEDAT_INI,
+                                           &slidedat_ref, err)) {
+    return false;
+  }
+
+  // hash the slidedat
+  g_autoptr(_openslide_readable) slidedat_readable = _openslide_readable_open(slidedat_ref, err);
+  if (!slidedat_readable || !_openslide_hash_readable(quickhash1, slidedat_readable, err)) {
+    return false;
+  }
+
+  const char *slidedat_path = _openslide_object_ref_get_debug_name(slidedat_ref);
   g_autoptr(GKeyFile) slidedat =
     _openslide_read_key_file(slidedat_path, SLIDEDAT_MAX_SIZE,
                              G_KEY_FILE_NONE, err);
@@ -1497,11 +1517,21 @@ static bool mirax_open(openslide_t *osr, const char *filename,
   POSITIVE_OR_FAIL(datafile_count);
 
   g_auto(GStrv) datafile_paths = g_new0(char *, datafile_count + 1);
+  g_autoptr(GPtrArray) datafile_refs_tmp =
+    g_ptr_array_new_full(datafile_count,
+                         (GDestroyNotify) _openslide_object_ref_unref);
+  g_ptr_array_set_size(datafile_refs_tmp, datafile_count);
   for (int i = 0; i < datafile_count; i++) {
     g_autofree char *key = g_strdup_printf(KEY_d_FILE, i);
     g_autofree char *name = NULL;
     READ_KEY_OR_FAIL(name, slidedat, GROUP_DATAFILE, key, value);
-    datafile_paths[i] = g_build_filename(dirname, name, NULL);
+    struct _openslide_object_ref *child_ref = NULL;
+    if (!_openslide_object_ref_resolve_child(bundle_ref, name,
+                                             &child_ref, err)) {
+      return false;
+    }
+    datafile_paths[i] = g_strdup(_openslide_object_ref_get_debug_name(child_ref));
+    datafile_refs_tmp->pdata[i] = child_ref;
   }
 
   // load data from all slide_zoom_level_section_names sections
@@ -1626,8 +1656,12 @@ static bool mirax_open(openslide_t *osr, const char *filename,
   */
 
   // read indexfile
-  g_autofree char *index_path = g_build_filename(dirname, index_filename, NULL);
-  g_autoptr(_openslide_file) indexfile = _openslide_fopen(index_path, err);
+  g_autoptr(_openslide_object_ref) index_ref = NULL;
+  if (!_openslide_object_ref_resolve_child(bundle_ref, index_filename,
+                                           &index_ref, err)) {
+    return false;
+  }
+  g_autoptr(_openslide_file) indexfile = _openslide_fopen_ref(index_ref, err);
   if (!indexfile) {
     return false;
   }
@@ -1856,7 +1890,9 @@ static bool mirax_open(openslide_t *osr, const char *filename,
   // set private data
   g_assert(osr->data == NULL);
   struct mirax_ops_data *data = g_new0(struct mirax_ops_data, 1);
-  data->datafile_paths = g_steal_pointer(&datafile_paths);
+  data->datafile_count = datafile_count;
+  data->datafile_refs = (struct _openslide_object_ref **)
+    g_ptr_array_free(g_steal_pointer(&datafile_refs_tmp), false);
   osr->data = data;
 
   // set ops
