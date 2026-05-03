@@ -19,6 +19,14 @@ meson setup builddir -Ds3=enabled -Dgcs=enabled -Dazure=enabled
 meson compile -C builddir
 ```
 
+To build the Docker-backed cloud integration test target as well, enable the
+optional Meson feature:
+
+```bash
+meson setup builddir -Ds3=enabled -Dgcs=enabled -Dazure=enabled -Dcloud_tests=enabled
+meson compile -C builddir
+```
+
 If a provider is not built, opening its URI fails with an error like:
 
 - `S3 URI support unavailable: OpenSlide built without S3 provider`
@@ -125,3 +133,37 @@ Default option values (when not overridden):
 - URI parse errors: ensure required URI parts are present:
   - S3 and GCS need `bucket` and `key`
   - Azure needs `account`, `container`, and `blob`
+
+## 6. Containerized cloud integration test
+
+The test suite includes an opt-in Docker-backed integration test that exercises
+cloud reads against local emulators using Python `testcontainers`:
+
+- S3: MinIO
+- GCS: `fsouza/fake-gcs-server`
+- Azure Blob: Azurite
+
+Requirements:
+
+- Docker must be running locally
+- Build with `-Ds3=enabled -Dgcs=enabled -Dazure=enabled`
+- Enable the Meson feature `-Dcloud_tests=enabled`
+
+Run the test from Meson:
+
+```bash
+meson test -C builddir cloud-read
+```
+
+Or run it directly through the existing Python test driver:
+
+```bash
+builddir/test/driver cloud
+```
+
+The default slide is `aperio-small-region`.  Override it with
+`OPENSLIDE_CLOUD_TEST_CASE`, for example:
+
+```bash
+OPENSLIDE_CLOUD_TEST_CASE=trestle builddir/test/driver cloud
+```

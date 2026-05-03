@@ -24,6 +24,8 @@
 #include "openslide-private.h"
 #include "openslide-storage-internal.h"
 
+#include <stdarg.h>
+
 #ifdef HAVE_GCS_PROVIDER
 static const struct _openslide_storage_provider_ops gcs_provider_ops;
 static const struct _openslide_readable_ops gcs_readable_ops;
@@ -31,6 +33,34 @@ static const struct _openslide_readable_ops gcs_readable_ops;
 static struct _openslide_storage_provider gcs_provider = {
   .ops = &gcs_provider_ops,
 };
+
+static bool gcs_trace_enabled(void) {
+  const char *debug = g_getenv("OPENSLIDE_DEBUG");
+  if (!debug) {
+    return false;
+  }
+
+  g_auto(GStrv) options = g_strsplit(debug, ",", -1);
+  for (char **option = options; *option != NULL; option++) {
+    g_strstrip(*option);
+    if (g_ascii_strcasecmp(*option, "detection") == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void gcs_trace(const char *format, ...) {
+  if (!gcs_trace_enabled()) {
+    return;
+  }
+
+  va_list ap;
+  va_start(ap, format);
+  g_autofree char *msg = g_strdup_vprintf(format, ap);
+  va_end(ap);
+  g_message("gcs: %s", msg);
+}
 
 static void secure_zero_free(char *secret) {
   if (!secret) {
@@ -145,6 +175,16 @@ static bool gcs_do_request(const struct gcs_settings *settings,
 
   uint32_t retries = settings->max_retries;
   for (uint32_t attempt = 0; attempt <= retries; attempt++) {
+    gcs_trace("request begin method=%s attempt=%u/%u bucket=%s key=%s endpoint=%s query=%s range=%s",
+              method,
+              attempt + 1,
+              retries + 1,
+              bucket,
+              key,
+              settings->endpoint,
+              query ? query : "(none)",
+              range_header ? range_header : "(none)");
+
     CURL *curl = curl_easy_init();
     if (!curl) {
       g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
@@ -181,6 +221,10 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cloud_grow_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &grow);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "openslide/4.1 gcs-provider");
+    if (cloud_should_skip_tls_verify()) {
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     CURLcode cc = curl_easy_perform(curl);
     long status = 0;
@@ -190,7 +234,25 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    if (cc == CURLE_OK && (status >= 200 && status < 300)) {
+    gcs_trace("request end method=%s attempt=%u/%u bucket=%s key=%s curl=%d status=%ld body_len=%zu content_length=%" PRId64,
+          method,
+          attempt + 1,
+          retries + 1,
+          bucket,
+          key,
+          cc,
+          status,
+          grow.len,
+          content_length >= 0 ? (int64_t) content_length : -1);
+
+     bool http_success = (status >= 200 && status < 300);
+     bool missing_status = (status == 0);
+    bool head_header_only_success =
+      (g_str_equal(method, "HEAD") &&
+       (cc == CURLE_OPERATION_TIMEDOUT || cc == CURLE_PARTIAL_FILE) &&
+       (http_success || missing_status));
+
+    if ((cc == CURLE_OK && http_success) || head_header_only_success) {
       result->http_status = status;
       result->body = grow.buf;
       result->body_len = grow.len;
@@ -201,6 +263,13 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     bool retry = cloud_is_retryable_curl(cc) || cloud_is_retryable_http(status);
     g_free(grow.buf);
     if (!retry || attempt == retries) {
+      gcs_trace("request terminal failure method=%s bucket=%s key=%s curl=%d status=%ld retry=%s",
+                method,
+                bucket,
+                key,
+                cc,
+                status,
+                retry ? "yes" : "no");
       if (cc != CURLE_OK) {
         g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                     "GCS %s failed for gs://%s/%s: %s",
@@ -220,6 +289,11 @@ static bool gcs_do_request(const struct gcs_settings *settings,
     }
 
     uint64_t backoff_ms = 100ULL << attempt;
+    gcs_trace("request retry method=%s bucket=%s key=%s backoff_ms=%" PRIu64,
+              method,
+              bucket,
+              key,
+              backoff_ms);
     g_usleep(backoff_ms * 1000);
   }
 

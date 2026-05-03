@@ -57,6 +57,17 @@ bool cloud_should_follow_redirect(bool has_auth_headers) {
   return !has_auth_headers;
 }
 
+bool cloud_should_skip_tls_verify(void) {
+  const char *value = g_getenv("OPENSLIDE_CLOUD_INSECURE_SKIP_VERIFY");
+  if (!value) {
+    return false;
+  }
+
+  return g_ascii_strcasecmp(value, "1") == 0 ||
+         g_ascii_strcasecmp(value, "true") == 0 ||
+         g_ascii_strcasecmp(value, "yes") == 0;
+}
+
 void cloud_init_curl_once(void) {
   static gsize curl_initialized = 0;
   if (g_once_init_enter(&curl_initialized)) {

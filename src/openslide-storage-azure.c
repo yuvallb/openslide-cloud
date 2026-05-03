@@ -220,6 +220,10 @@ static bool azure_do_request(const struct azure_settings *settings,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cloud_grow_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &grow);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "openslide/4.1 azure-provider");
+    if (cloud_should_skip_tls_verify()) {
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     CURLcode cc = curl_easy_perform(curl);
     long status = 0;

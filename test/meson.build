@@ -107,7 +107,7 @@ executable(
 
 # Driver
 subdir('env')
-configure_file(
+driver = configure_file(
   input : 'driver.py',
   output : 'driver',
   configuration : {
@@ -128,3 +128,12 @@ configure_file(
     'VERSION' : meson.project_version(),
   },
 )
+if get_option('cloud_tests').enabled()
+  test(
+    'cloud-read',
+    test_python,
+    args : [driver, 'cloud'],
+    suite : ['cloud'],
+    timeout : 600,
+  )
+endif

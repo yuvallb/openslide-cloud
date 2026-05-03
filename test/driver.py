@@ -27,19 +27,21 @@ from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from configparser import RawConfigParser
 from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
 import errno
 import filecmp
 import fnmatch
 from functools import cached_property, lru_cache
 from hashlib import sha256
 import inspect
+import json
 from lzma import LZMACompressor
 import os
 from pathlib import Path, PurePath
 import platform
 import re
 import shlex
-from shutil import copytree, rmtree
+from shutil import copy2, copytree, rmtree, which
 import subprocess
 import sys
 import tarfile
@@ -51,7 +53,7 @@ from tempfile import (
 )
 import textwrap
 from threading import Thread
-from time import time as curtime
+from time import sleep, time as curtime
 from typing import (
     Any,
     BinaryIO,
@@ -59,7 +61,7 @@ from typing import (
     Protocol,
     cast,
 )
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from zipfile import ZipFile
 
 import boto3
@@ -101,6 +103,15 @@ GREEN = '\033[1;32m'
 BLUE = '\033[1;34m'
 RED = '\033[1;31m'
 RESET = '\033[1;0m'
+
+CLOUD_TEST_CASE = os.getenv('OPENSLIDE_CLOUD_TEST_CASE', 'aperio-small-region')
+CLOUD_TEST_BUCKET = 'openslide-cloud-test'
+CLOUD_TEST_CONTAINER = 'slides'
+AZURITE_DEFAULT_ACCOUNT = 'devstoreaccount1'
+AZURITE_DEFAULT_KEY = (
+    'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/'
+    'KBHBeksoGMGw=='
+)
 
 _commands = []
 _command_funcs = {}
@@ -797,6 +808,504 @@ class S3Uploader:
             },
         )
         print('{:<79}'.format(f'Uploaded {length >> 20} MB'))
+
+
+def _cloud_prepare_case(testname: str) -> tuple[TestCaseConfig, Path, list[Path]]:
+    test = TestCase(testname)
+    conf = test.conf
+    if not conf.success:
+        raise ValueError(f'Cloud test case must succeed: {testname}')
+    if conf.filename == '':
+        raise ValueError(f'Cloud test case must have a slide filename: {testname}')
+
+    test.unpack()
+    root = WORKROOT / test.name
+    files = sorted(path for path in root.rglob('*') if path.is_file())
+    if not files:
+        raise OSError(f'No unpacked files found for {testname}')
+    return conf, root, files
+
+
+def _cloud_generate_certificates(certdir: Path) -> Path:
+    openssl = which('openssl')
+    if openssl is None:
+        raise OSError('openssl is required for cloud tests')
+
+    cert_path = certdir / 'public.crt'
+    key_path = certdir / 'private.key'
+    san = 'DNS:localhost,DNS:blob.localhost,DNS:*.blob.localhost,IP:127.0.0.1'
+    subprocess.run(
+        [
+            openssl,
+            'req',
+            '-x509',
+            '-nodes',
+            '-newkey',
+            'rsa:2048',
+            '-keyout',
+            key_path,
+            '-out',
+            cert_path,
+            '-days',
+            '2',
+            '-subj',
+            '/CN=localhost',
+            '-addext',
+            'subjectAltName=' + san,
+            '-addext',
+            'basicConstraints=critical,CA:TRUE',
+            '-addext',
+            'keyUsage=critical,keyCertSign,digitalSignature,keyEncipherment',
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return cert_path
+
+
+def _cloud_base_env(cert_path: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    no_proxy = [item for item in env.get('NO_PROXY', '').split(',') if item]
+    no_proxy.extend(['127.0.0.1', 'localhost', '.localhost'])
+    env.update(
+        AWS_CA_BUNDLE=cert_path.as_posix(),
+        AWS_EC2_METADATA_DISABLED='true',
+        CURL_CA_BUNDLE=cert_path.as_posix(),
+        G_MESSAGES_DEBUG='all',
+        GIO_USE_VFS='local',
+        NO_PROXY=','.join(dict.fromkeys(no_proxy)),
+        OPENSLIDE_CLOUD_INSECURE_SKIP_VERIFY='1',
+        OPENSLIDE_DEBUG='detection',
+        REQUESTS_CA_BUNDLE=cert_path.as_posix(),
+        SSL_CERT_FILE=cert_path.as_posix(),
+    )
+    return env
+
+
+def _cloud_wait_for_https(
+    url: str,
+    cert_path: Path,
+    statuses: Iterable[int],
+    timeout: float = 30,
+) -> None:
+    allowed = set(statuses)
+    deadline = curtime() + timeout
+    last_error: str | None = None
+    while curtime() < deadline:
+        try:
+            resp = requests.get(url, timeout=1, verify=cert_path)
+            if resp.status_code in allowed:
+                return
+            last_error = f'HTTP {resp.status_code}'
+        except requests.RequestException as exc:
+            last_error = str(exc)
+        sleep(0.25)
+    raise TimeoutError(f'Timed out waiting for {url}: {last_error}')
+
+
+def _cloud_copy_seed_data(
+    dest_root: Path,
+    slide_root: Path,
+    files: Iterable[Path],
+) -> None:
+    for path in files:
+        relpath = path.relative_to(slide_root)
+        dest = dest_root / relpath
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        copy2(path, dest, follow_symlinks=True)
+
+
+def _cloud_upload_s3(
+    endpoint: str,
+    cert_path: Path,
+    slide_root: Path,
+    files: Iterable[Path],
+    prefix: PurePath,
+) -> None:
+    from botocore.config import Config as BotoConfig
+
+    client = boto3.client(
+        's3',
+        endpoint_url=f'https://{endpoint}',
+        aws_access_key_id='minioadmin',
+        aws_secret_access_key='minioadmin',
+        region_name='us-east-1',
+        verify=cert_path.as_posix(),
+        config=BotoConfig(s3={'addressing_style': 'path'}),
+    )
+
+    deadline = curtime() + 30
+    while True:
+        try:
+            client.list_buckets()
+            break
+        except Exception:
+            if curtime() >= deadline:
+                raise
+            sleep(0.25)
+
+    client.create_bucket(Bucket=CLOUD_TEST_BUCKET)
+    client.put_bucket_policy(
+        Bucket=CLOUD_TEST_BUCKET,
+        Policy=json.dumps(
+            {
+                'Version': '2012-10-17',
+                'Statement': [
+                    {
+                        'Sid': 'PublicReadForCloudTests',
+                        'Effect': 'Allow',
+                        'Principal': '*',
+                        'Action': ['s3:GetObject'],
+                        'Resource': [
+                            f'arn:aws:s3:::{CLOUD_TEST_BUCKET}/*',
+                        ],
+                    },
+                ],
+            }
+        ),
+    )
+    for path in files:
+        key = (prefix / path.relative_to(slide_root)).as_posix()
+        with open(path, 'rb') as fh:
+            client.upload_fileobj(fh, CLOUD_TEST_BUCKET, key)
+
+
+def _cloud_upload_azure(
+    port: int,
+    cert_path: Path,
+    slide_root: Path,
+    files: Iterable[Path],
+    prefix: PurePath,
+) -> str:
+    from azure.core.credentials import AzureNamedKeyCredential
+    from azure.core.exceptions import ResourceExistsError
+    from azure.storage.blob import (
+        BlobServiceClient,
+        ContainerSasPermissions,
+        generate_container_sas,
+    )
+
+    account_url = (
+        f'https://{AZURITE_DEFAULT_ACCOUNT}.blob.localhost:{port}'
+    )
+    client = BlobServiceClient(
+        account_url=account_url,
+        credential=AzureNamedKeyCredential(
+            AZURITE_DEFAULT_ACCOUNT,
+            AZURITE_DEFAULT_KEY,
+        ),
+        connection_verify=cert_path.as_posix(),
+    )
+
+    deadline = curtime() + 30
+    while True:
+        try:
+            client.get_service_properties()
+            break
+        except Exception:
+            if curtime() >= deadline:
+                raise
+            sleep(0.25)
+
+    container = client.get_container_client(CLOUD_TEST_CONTAINER)
+    try:
+        container.create_container()
+    except ResourceExistsError:
+        pass
+
+    for path in files:
+        blob_name = (prefix / path.relative_to(slide_root)).as_posix()
+        with open(path, 'rb') as fh:
+            container.upload_blob(blob_name, fh, overwrite=True)
+
+    return generate_container_sas(
+        account_name=AZURITE_DEFAULT_ACCOUNT,
+        container_name=CLOUD_TEST_CONTAINER,
+        account_key=AZURITE_DEFAULT_KEY,
+        permission=ContainerSasPermissions(read=True, list=True),
+        expiry=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+
+def _cloud_upload_gcs(
+    port: int,
+    cert_path: Path,
+    slide_root: Path,
+    files: Iterable[Path],
+    prefix: PurePath,
+) -> None:
+    base_url = f'https://localhost:{port}'
+    project = 'openslide-cloud-tests'
+
+    # Ensure the API is reachable before issuing create/upload requests.
+    deadline = curtime() + 30
+    while True:
+        try:
+            resp = requests.get(
+                f'{base_url}/storage/v1/b',
+                params={'project': project},
+                timeout=2,
+                verify=cert_path,
+            )
+            if resp.status_code == 200:
+                break
+        except requests.RequestException:
+            pass
+        if curtime() >= deadline:
+            raise TimeoutError('Timed out waiting for fake-gcs-server API')
+        sleep(0.25)
+
+    create = requests.post(
+        f'{base_url}/storage/v1/b',
+        params={'project': project},
+        json={'name': CLOUD_TEST_BUCKET},
+        timeout=10,
+        verify=cert_path,
+    )
+    if create.status_code not in {200, 409}:
+        create.raise_for_status()
+
+    for path in files:
+        key = (prefix / path.relative_to(slide_root)).as_posix()
+        with open(path, 'rb') as fh:
+            upload = requests.post(
+                (
+                    f'{base_url}/upload/storage/v1/b/{CLOUD_TEST_BUCKET}/o'
+                    f'?uploadType=media&name={quote(key, safe="/")}'
+                ),
+                data=fh,
+                timeout=30,
+                verify=cert_path,
+                headers={'Content-Type': 'application/octet-stream'},
+            )
+        upload.raise_for_status()
+
+
+def _cloud_run_try_open(
+    label: str,
+    target: str,
+    conf: TestCaseConfig,
+    extra_env: dict[str, str],
+) -> None:
+    env = _cloud_base_env(Path(extra_env['CURL_CA_BUNDLE']))
+    env.update(extra_env)
+
+    args: list[str] = [(BUILDDIR / 'try_open').as_posix()]
+    for key, value in sorted(conf.properties.items()):
+        args.extend(['--property', f'{key}={value}'])
+    regions = conf.regions or [[0, 0, 0, 1, 1]]
+    for region in regions:
+        args.extend(['--region', ' '.join(str(value) for value in region)])
+    args.append(target)
+
+    print(f'cloud test: opening {label} target {target}', file=sys.stderr)
+    sys.stderr.flush()
+
+    try:
+        proc = subprocess.run(
+            args,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_stdout = exc.stdout or ''
+        timeout_stderr = exc.stderr or ''
+        if isinstance(timeout_stdout, bytes):
+            timeout_stdout = timeout_stdout.decode(errors='replace')
+        if isinstance(timeout_stderr, bytes):
+            timeout_stderr = timeout_stderr.decode(errors='replace')
+        partial = '\n'.join(
+            part
+            for part in [
+                timeout_stdout.strip(),
+                timeout_stderr.strip(),
+            ]
+            if part
+        )
+        if partial:
+            raise TimeoutError(
+                f'Cloud open timed out for {label}: {target}\n{partial}'
+            ) from exc
+        raise TimeoutError(f'Cloud open timed out for {label}: {target}') from exc
+
+    out = proc.stdout
+    err = proc.stderr
+    if proc.returncode:
+        details = '\n'.join(part for part in [out.strip(), err.strip()] if part)
+        raise OSError(
+            f'Cloud open failed for {target}: {details or f"exit {proc.returncode}"}'
+        )
+
+
+def _cloud_test_summary(label: str, target: str) -> None:
+    print(_color(GREEN, f'{label}: OK ({target})'))
+
+
+def _cloud_require_features() -> None:
+    required = {'s3-provider', 'gcs-provider', 'azure-provider'}
+    missing = sorted(required - FEATURES)
+    if missing:
+        raise RuntimeError(
+            'Missing cloud providers in this build: ' + ', '.join(missing)
+        )
+
+
+@_command
+def cloud(testname: str = CLOUD_TEST_CASE) -> None:
+    """Run Docker-backed cloud read tests against S3, GCS, and Azure emulators."""
+    _cloud_require_features()
+
+    try:
+        from testcontainers.core.container import DockerContainer
+    except ImportError as exc:
+        raise RuntimeError(
+            'testcontainers is required; rebuild the test env from test/requirements.txt'
+        ) from exc
+
+    try:
+        subprocess.run(
+            ['docker', 'info'],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError('Docker must be available for cloud tests') from exc
+
+    conf, slide_root, files = _cloud_prepare_case(testname)
+    prefix = PurePath('slides') / testname
+    main_object = prefix / PurePath(conf.filename)
+
+    with TemporaryDirectory(prefix='openslide-cloud-') as tempdir_name:
+        tempdir = Path(tempdir_name)
+        certdir = tempdir / 'certs'
+        certdir.mkdir(parents=True)
+        cert_path = _cloud_generate_certificates(certdir)
+
+        with (
+            DockerContainer('minio/minio:latest')
+            .with_exposed_ports(9000)
+            .with_env('MINIO_ROOT_USER', 'minioadmin')
+            .with_env('MINIO_ROOT_PASSWORD', 'minioadmin')
+            .with_volume_mapping(certdir, '/certs', 'ro')
+            .with_command(
+                ['server', '/data', '--address', ':9000', '--certs-dir', '/certs']
+            ) as minio,
+            DockerContainer('fsouza/fake-gcs-server:latest')
+            .with_exposed_ports(4443)
+            .with_volume_mapping(certdir, '/certs', 'ro')
+            .with_command(
+                [
+                    '-cert-location',
+                    '/certs/public.crt',
+                    '-private-key-location',
+                    '/certs/private.key',
+                ]
+            ) as gcs,
+            DockerContainer('mcr.microsoft.com/azure-storage/azurite:latest')
+            .with_exposed_ports(10000)
+            .with_volume_mapping(certdir, '/certs', 'ro')
+            .with_command(
+                [
+                    'azurite-blob',
+                    '--blobHost',
+                    '0.0.0.0',
+                    '--blobPort',
+                    '10000',
+                    '--cert',
+                    '/certs/public.crt',
+                    '--key',
+                    '/certs/private.key',
+                    '--skipApiVersionCheck',
+                    '--disableTelemetry',
+                ]
+            ) as azurite,
+        ):
+            minio_port = int(minio.get_exposed_port(9000))
+            gcs_port = int(gcs.get_exposed_port(4443))
+            azurite_port = int(azurite.get_exposed_port(10000))
+
+            _cloud_wait_for_https(
+                f'https://localhost:{minio_port}/minio/health/live',
+                cert_path,
+                {200},
+            )
+            _cloud_wait_for_https(
+                f'https://localhost:{gcs_port}/storage/v1/b',
+                cert_path,
+                {200},
+            )
+
+            _cloud_upload_s3(
+                f'localhost:{minio_port}',
+                cert_path,
+                slide_root,
+                files,
+                prefix,
+            )
+            _cloud_upload_gcs(
+                gcs_port,
+                cert_path,
+                slide_root,
+                files,
+                prefix,
+            )
+            azure_sas = _cloud_upload_azure(
+                azurite_port,
+                cert_path,
+                slide_root,
+                files,
+                prefix,
+            )
+
+            s3_target = f's3://{CLOUD_TEST_BUCKET}/{main_object.as_posix()}'
+            gcs_target = f'gs://{CLOUD_TEST_BUCKET}/{main_object.as_posix()}'
+            azure_target = (
+                f'az://{AZURITE_DEFAULT_ACCOUNT}/{CLOUD_TEST_CONTAINER}/'
+                f'{main_object.as_posix()}'
+            )
+
+            _cloud_run_try_open(
+                'S3',
+                s3_target,
+                conf,
+                {
+                    'CURL_CA_BUNDLE': cert_path.as_posix(),
+                    'OPENSLIDE_S3_ENDPOINT': f'localhost:{minio_port}',
+                    'OPENSLIDE_S3_REGION': 'us-east-1',
+                },
+            )
+            _cloud_test_summary('S3', s3_target)
+
+            _cloud_run_try_open(
+                'GCS',
+                gcs_target,
+                conf,
+                {
+                    'CURL_CA_BUNDLE': cert_path.as_posix(),
+                    'OPENSLIDE_GCS_ENDPOINT': f'localhost:{gcs_port}',
+                },
+            )
+            _cloud_test_summary('GCS', gcs_target)
+
+            _cloud_run_try_open(
+                'Azure',
+                azure_target,
+                conf,
+                {
+                    'CURL_CA_BUNDLE': cert_path.as_posix(),
+                    'OPENSLIDE_AZURE_ENDPOINT_SUFFIX': (
+                        f'blob.localhost:{azurite_port}'
+                    ),
+                    'OPENSLIDE_AZURE_SAS_TOKEN': azure_sas,
+                },
+            )
+            _cloud_test_summary('Azure', azure_target)
 
 
 def _download(url: str, name: str, fh: BinaryIO) -> str:

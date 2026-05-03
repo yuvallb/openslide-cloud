@@ -24,6 +24,8 @@
 #include "openslide-private.h"
 #include "openslide-storage-internal.h"
 
+#include <stdarg.h>
+
 #ifdef HAVE_S3_PROVIDER
 static const struct _openslide_storage_provider_ops s3_provider_ops;
 static const struct _openslide_readable_ops s3_readable_ops;
@@ -31,6 +33,34 @@ static const struct _openslide_readable_ops s3_readable_ops;
 static struct _openslide_storage_provider s3_provider = {
   .ops = &s3_provider_ops,
 };
+
+static bool s3_trace_enabled(void) {
+  const char *debug = g_getenv("OPENSLIDE_DEBUG");
+  if (!debug) {
+    return false;
+  }
+
+  g_auto(GStrv) options = g_strsplit(debug, ",", -1);
+  for (char **option = options; *option != NULL; option++) {
+    g_strstrip(*option);
+    if (g_ascii_strcasecmp(*option, "detection") == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void s3_trace(const char *format, ...) {
+  if (!s3_trace_enabled()) {
+    return;
+  }
+
+  va_list ap;
+  va_start(ap, format);
+  g_autofree char *msg = g_strdup_vprintf(format, ap);
+  va_end(ap);
+  g_message("s3: %s", msg);
+}
 
 static void secure_zero_free(char *secret) {
   if (!secret) {
@@ -332,9 +362,15 @@ static void s3_request_slot_acquire(struct s3_settings *settings) {
 
   g_mutex_lock(&settings->request_limit_mutex);
   while (settings->active_requests >= settings->max_parallel_requests) {
+    s3_trace("request slot wait active=%u max=%u",
+             settings->active_requests,
+             settings->max_parallel_requests);
     g_cond_wait(&settings->request_limit_cond, &settings->request_limit_mutex);
   }
   settings->active_requests++;
+  s3_trace("request slot acquired active=%u max=%u",
+           settings->active_requests,
+           settings->max_parallel_requests);
   g_mutex_unlock(&settings->request_limit_mutex);
 }
 
@@ -346,6 +382,9 @@ static void s3_request_slot_release(struct s3_settings *settings) {
   g_mutex_lock(&settings->request_limit_mutex);
   g_assert(settings->active_requests > 0);
   settings->active_requests--;
+  s3_trace("request slot released active=%u max=%u",
+           settings->active_requests,
+           settings->max_parallel_requests);
   g_cond_signal(&settings->request_limit_cond);
   g_mutex_unlock(&settings->request_limit_mutex);
 }
@@ -497,6 +536,18 @@ static bool s3_do_request(const struct s3_settings *settings,
 
   uint32_t retries = settings->max_retries;
   for (uint32_t attempt = 0; attempt <= retries; attempt++) {
+    s3_trace("request begin method=%s attempt=%u/%u bucket=%s key=%s host=%s path=%s query=%s range=%s signed=%s",
+             method,
+             attempt + 1,
+             retries + 1,
+             bucket,
+             key,
+             host,
+             request_path,
+             query ? query : "(none)",
+             range_header ? range_header : "(none)",
+             s3_should_sign(settings) ? "yes" : "no");
+
     CURL *curl = curl_easy_init();
     if (!curl) {
       g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
@@ -534,6 +585,10 @@ static bool s3_do_request(const struct s3_settings *settings,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cloud_grow_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &grow);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "openslide/4.1 s3-provider");
+    if (cloud_should_skip_tls_verify()) {
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 
     s3_request_slot_acquire((struct s3_settings *) settings);
     CURLcode cc = curl_easy_perform(curl);
@@ -545,17 +600,55 @@ static bool s3_do_request(const struct s3_settings *settings,
     curl_easy_cleanup(curl);
     s3_request_slot_release((struct s3_settings *) settings);
 
-    if (cc == CURLE_OK && (status >= 200 && status < 300)) {
+    s3_trace("request end method=%s attempt=%u/%u bucket=%s key=%s curl=%d status=%ld body_len=%zu content_length=%" PRId64,
+             method,
+             attempt + 1,
+             retries + 1,
+             bucket,
+             key,
+             cc,
+             status,
+             grow.len,
+             content_length >= 0 ? (int64_t) content_length : -1);
+
+    bool http_success = (status >= 200 && status < 300);
+    bool head_header_only_success =
+      (g_str_equal(method, "HEAD") &&
+       cc == CURLE_OPERATION_TIMEDOUT &&
+       http_success &&
+       content_length >= 0);
+
+    if ((cc == CURLE_OK && http_success) || head_header_only_success) {
       result->http_status = status;
       result->body = grow.buf;
       result->body_len = grow.len;
       result->content_length = content_length >= 0 ? (int64_t) content_length : -1;
+      if (head_header_only_success) {
+        s3_trace("request treated as HEAD success despite curl timeout method=%s bucket=%s key=%s status=%ld content_length=%" PRId64,
+                 method,
+                 bucket,
+                 key,
+                 status,
+                 result->content_length);
+      }
+      s3_trace("request success method=%s bucket=%s key=%s status=%ld",
+               method,
+               bucket,
+               key,
+               status);
       return true;
     }
 
     bool retry = cloud_is_retryable_curl(cc) || cloud_is_retryable_http(status);
     g_free(grow.buf);
     if (!retry || attempt == retries) {
+      s3_trace("request terminal failure method=%s bucket=%s key=%s curl=%d status=%ld retry=%s",
+               method,
+               bucket,
+               key,
+               cc,
+               status,
+               retry ? "yes" : "no");
       if (cc != CURLE_OK) {
         g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                     "S3 %s failed for s3://%s/%s: %s",
@@ -575,6 +668,11 @@ static bool s3_do_request(const struct s3_settings *settings,
     }
 
     uint64_t backoff_ms = 100ULL << attempt;
+    s3_trace("request retry method=%s bucket=%s key=%s backoff_ms=%" PRIu64,
+             method,
+             bucket,
+             key,
+             backoff_ms);
     g_usleep(backoff_ms * 1000);
   }
 
@@ -636,8 +734,15 @@ static bool s3_stat(struct _openslide_storage_provider *provider G_GNUC_UNUSED,
                     GError **err) {
   const struct s3_object_ref_data *data = ref->provider_data;
   if (s3_stat_cached(data, out)) {
+    s3_trace("stat cache hit bucket=%s key=%s exists=%s size=%" PRId64,
+             data->bucket,
+             data->key,
+             out->exists ? "yes" : "no",
+             out->size);
     return true;
   }
+
+  s3_trace("stat HEAD bucket=%s key=%s", data->bucket, data->key);
 
   struct s3_http_result result = {0};
   if (!s3_do_request(data->settings,
@@ -649,6 +754,7 @@ static bool s3_stat(struct _openslide_storage_provider *provider G_GNUC_UNUSED,
                      &result,
                      err)) {
     if (err && *err && strstr((*err)->message, "HTTP 404")) {
+      s3_trace("stat HEAD not found bucket=%s key=%s", data->bucket, data->key);
       g_clear_error(err);
       out->exists = false;
       out->is_container = false;
@@ -656,12 +762,20 @@ static bool s3_stat(struct _openslide_storage_provider *provider G_GNUC_UNUSED,
       s3_stat_store_cache(data, out);
       return true;
     }
+    s3_trace("stat HEAD failed bucket=%s key=%s error=%s",
+             data->bucket,
+             data->key,
+             (err && *err) ? (*err)->message : "unknown");
     return false;
   }
 
   out->exists = true;
   out->is_container = false;
   out->size = result.content_length;
+  s3_trace("stat HEAD success bucket=%s key=%s size=%" PRId64,
+           data->bucket,
+           data->key,
+           out->size);
   s3_stat_store_cache(data, out);
   g_free(result.body);
   return true;
@@ -830,6 +944,12 @@ static bool s3_readable_read_at(struct _openslide_readable *obj,
 
   const struct s3_object_ref_data *data = obj->ref->provider_data;
   if (s3_range_cache_read(data, offset, len, buf, bytes_read)) {
+    s3_trace("range cache hit bucket=%s key=%s offset=%" PRId64 " len=%zu bytes_read=%zu",
+             data->bucket,
+             data->key,
+             offset,
+             len,
+             *bytes_read);
     return true;
   }
 
@@ -845,8 +965,19 @@ static bool s3_readable_read_at(struct _openslide_readable *obj,
     inflight->waiters = 1;
     g_hash_table_insert(settings->inflight_ranges, g_strdup(range_key), inflight);
     leader = true;
+    s3_trace("range inflight leader bucket=%s key=%s offset=%" PRId64 " len=%zu",
+             data->bucket,
+             data->key,
+             offset,
+             len);
   } else {
     inflight->waiters++;
+    s3_trace("range inflight follower bucket=%s key=%s offset=%" PRId64 " len=%zu waiters=%d",
+             data->bucket,
+             data->key,
+             offset,
+             len,
+             inflight->waiters);
   }
   g_mutex_unlock(&settings->range_cache_mutex);
 
@@ -868,6 +999,12 @@ static bool s3_readable_read_at(struct _openslide_readable *obj,
       g_strdup_printf("Range: bytes=%" PRId64 "-%" PRId64, offset, end);
 
     struct s3_http_result result = {0};
+    s3_trace("range GET begin bucket=%s key=%s offset=%" PRId64 " len=%zu range=%s",
+         data->bucket,
+         data->key,
+         offset,
+         len,
+         range);
     bool ok = s3_do_request(data->settings,
                             "GET",
                             data->bucket,
@@ -882,9 +1019,21 @@ static bool s3_readable_read_at(struct _openslide_readable *obj,
       inflight->success = true;
       inflight->data = result.body;
       inflight->len = result.body_len;
+      s3_trace("range GET success bucket=%s key=%s offset=%" PRId64 " len=%zu body_len=%zu",
+               data->bucket,
+               data->key,
+               offset,
+               len,
+               result.body_len);
     } else {
       inflight->success = false;
       inflight->error_message = g_strdup((err && *err) ? (*err)->message : "S3 read failed");
+      s3_trace("range GET failed bucket=%s key=%s offset=%" PRId64 " len=%zu error=%s",
+               data->bucket,
+               data->key,
+               offset,
+               len,
+               inflight->error_message);
       if (err && *err) {
         g_clear_error(err);
       }
@@ -894,8 +1043,21 @@ static bool s3_readable_read_at(struct _openslide_readable *obj,
   } else {
     g_mutex_lock(&settings->range_cache_mutex);
     while (!inflight->done) {
+      s3_trace("range inflight follower wait bucket=%s key=%s offset=%" PRId64 " len=%zu waiters=%d",
+               data->bucket,
+               data->key,
+               offset,
+               len,
+               inflight->waiters);
       g_cond_wait(&inflight->done_cond, &settings->range_cache_mutex);
     }
+    s3_trace("range inflight follower resume bucket=%s key=%s offset=%" PRId64 " len=%zu success=%s body_len=%zu",
+             data->bucket,
+             data->key,
+             offset,
+             len,
+             inflight->success ? "yes" : "no",
+             inflight->len);
   }
 
   bool success = inflight->success;
@@ -916,6 +1078,13 @@ static bool s3_readable_read_at(struct _openslide_readable *obj,
   }
 
   inflight->waiters--;
+  s3_trace("range inflight done bucket=%s key=%s offset=%" PRId64 " len=%zu success=%s remaining_waiters=%d",
+           data->bucket,
+           data->key,
+           offset,
+           len,
+           success ? "yes" : "no",
+           inflight->waiters);
   if (inflight->waiters == 0) {
     g_hash_table_remove(settings->inflight_ranges, range_key);
   }

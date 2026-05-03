@@ -34,6 +34,12 @@ option(
   description : 'Enable Azure Blob Storage provider support',
 )
 option(
+  'cloud_tests',
+  type : 'feature',
+  value : 'disabled',
+  description : 'Enable Docker-backed cloud storage integration tests',
+)
+option(
   '_export_internal_symbols',
   type : 'boolean',
   value : false,

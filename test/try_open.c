@@ -43,6 +43,13 @@ static gboolean time_check;
 
 static bool have_error = false;
 
+static bool is_uri(const char *path) {
+  return g_str_has_prefix(path, "s3://") ||
+         g_str_has_prefix(path, "gs://") ||
+         g_str_has_prefix(path, "az://") ||
+         g_str_has_prefix(path, "file://");
+}
+
 static void fail(const char *str, ...) {
   va_list ap;
 
@@ -206,8 +213,12 @@ int main(int argc, char **argv) {
       (G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING),
       print_log, NULL);
 
-  const char *vendor = openslide_detect_vendor(filename);
-  openslide_t *osr = openslide_open(filename);
+  const bool path_is_uri = is_uri(filename);
+  const char *vendor = path_is_uri ? NULL : openslide_detect_vendor(filename);
+  openslide_t *osr = path_is_uri ? openslide_open_uri(filename) : openslide_open(filename);
+  if (vendor == NULL && osr != NULL && openslide_get_error(osr) == NULL) {
+    vendor = openslide_get_property_value(osr, OPENSLIDE_PROPERTY_NAME_VENDOR);
+  }
 
   // Check vendor if requested
   if (vendor_check) {
@@ -261,7 +272,7 @@ int main(int argc, char **argv) {
       } else {
         timer = g_timer_new();
       }
-      osr = openslide_open(filename);
+      osr = path_is_uri ? openslide_open_uri(filename) : openslide_open(filename);
       g_timer_stop(timer);
 
       // Check for errors and clean up

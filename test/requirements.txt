@@ -1,5 +1,7 @@
 # Python dependencies for driver.py
 
+azure-storage-blob >= 12.25
 boto3 >= 1.38
 PyYAML >= 6
 requests >= 2.32
+testcontainers >= 4.13
